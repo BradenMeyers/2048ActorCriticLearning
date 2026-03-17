@@ -137,7 +137,7 @@ class Game2048:
     def _apply_move(self, move: Move) -> int:
         """Rotate board so every move reduces to a LEFT merge."""
         rotations = {Move.LEFT: 0, Move.RIGHT: 2,
-                     Move.UP:   3, Move.DOWN:  1}
+                     Move.UP:   1, Move.DOWN:  3}
         k = rotations[move]
         self.board = np.rot90(self.board, k)
         reward = self._merge_left()
