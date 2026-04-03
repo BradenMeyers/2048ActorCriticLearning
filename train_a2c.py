@@ -427,7 +427,7 @@ def evaluate(checkpoint_path: str = "a2c_checkpoint.pt", n_games: int = 100):
         print(f"    {tile:>5}: {bar:<40} {pct:.1f}%")
 
 
-def display_agent(net: ActorCritic, n_games: int = 5):
+def display_agent(net: ActorCritic, n_games: int = 5, speed: int = 2):
     """
     Display the agent playing n_games with pygame.
     """
@@ -468,7 +468,7 @@ def display_agent(net: ActorCritic, n_games: int = 5):
                         screen.blit(text, text_rect)
 
             pygame.display.flip()
-            clock.tick(30)  # slow down for visibility
+            clock.tick(speed)  # slow down for visibility
         # Print stats of game
         print(f"\n{'='*45}")
         print(f"  A2C Agent Display")
@@ -478,6 +478,10 @@ def display_agent(net: ActorCritic, n_games: int = 5):
     pygame.quit()
 
 # ===== CLI
+
+# TODO: Should look at gamma because we care about future rewards a lot
+# but we need it to make it so we don't lose the game. 
+# Do we need a negative reward for losing?
 
 def main():
     p = argparse.ArgumentParser(description="A2C trainer for 2048")
@@ -491,7 +495,7 @@ def main():
     p.add_argument("--eval",         action="store_true",
                    help="evaluate a saved checkpoint instead of training")
     p.add_argument("--eval-games",   type=int, default=100)
-    p.add_argument("--display",      action="store_true",
+    p.add_argument("--display",      type=int, default=2,
                    help="display a saved checkpoint in a pygame window")
     args = p.parse_args()
 
@@ -501,7 +505,7 @@ def main():
         net = ActorCritic().to(DEVICE)
         checkpoint = torch.load(args.checkpoint, map_location=DEVICE)
         net.load_state_dict(checkpoint["model_state_dict"])
-        display_agent(net, n_games=1)
+        display_agent(net, n_games=1, speed=args.display)
     else:
         train(
             n_episodes   = args.episodes,
