@@ -196,7 +196,7 @@ def train(
     n_episodes:      int   = 2000,
     gamma:           float = 0.99,
     lr:              float = 1e-3,
-    entropy_coef:    float = 0.01,
+    entropy_coef:    float = 0.005,
     value_coef:      float = 0.5,
     max_steps:       int   = 5000,
     checkpoint_path: str   = "a2c_checkpoint.pt",
@@ -277,10 +277,6 @@ def train(
 
         returns   = compute_returns(rewards, last_value, gamma)
         returns_t = torch.tensor(returns, dtype=torch.float32).to(DEVICE)
-        
-        # normalize returns to stabilize critic learning
-        returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
-        
         values_t  = torch.stack(values)
         log_probs_t = torch.stack(log_probs)
 
@@ -288,27 +284,23 @@ def train(
         # Detach values so critic gradient doesn't flow through the advantage
         advantages = returns_t - values_t.detach()
 
-        # Normalize advantages — helps training stability
         if len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            returns_t   = (returns_t   - returns_t.mean())   / (returns_t.std()   + 1e-8)
+            advantages  = (advantages  - advantages.mean())  / (advantages.std()  + 1e-8)
 
         # ---- compute losses ----
 
         # Actor loss: negative log-prob weighted by advantage
-        # If advantage > 0 (better than expected), increase probability of this action
-        # If advantage < 0 (worse than expected), decrease probability
         actor_loss = -(log_probs_t * advantages).mean()
 
-        # Critic loss: MSE between predicted value and actual return
-        # Train the critic to predict returns accurately
+        # Critic loss
         critic_loss = F.mse_loss(values_t, returns_t)
 
-        # Entropy bonus: encourages exploration by penalizing overconfident policies
-        # Without this the policy often collapses to always picking one move
-        policy_stack = torch.stack([
-            net(s, m)[0] for s, m in zip(states, masks)
-        ])
-        entropy = -(policy_stack * torch.log(policy_stack + 1e-8)).sum(dim=-1).mean()
+        # Entropy estimate from stored log_probs — no need to re-run forward passes.
+        # -E[log π(a)] is a valid per-step entropy estimate for the sampled actions.
+        # Re-running forward passes (previous bug) doubled compute and created a
+        # disconnected computation graph.
+        entropy = -log_probs_t.mean()
 
         # Combined loss
         loss = actor_loss + value_coef * critic_loss - entropy_coef * entropy
@@ -474,14 +466,15 @@ def main():
     p.add_argument("--episodes",     type=int,   default=2000)
     p.add_argument("--gamma",        type=float, default=0.99)
     p.add_argument("--lr",           type=float, default=1e-3)
-    p.add_argument("--entropy-coef", type=float, default=0.01)
+    p.add_argument("--entropy-coef", type=float, default=0.005)
     p.add_argument("--value-coef",   type=float, default=0.5)
     p.add_argument("--log-every",    type=int,   default=50)
     p.add_argument("--checkpoint",   default="a2c_checkpoint.pt")
-    p.add_argument("--display",      action="store_true")
     p.add_argument("--eval",         action="store_true",
                    help="evaluate a saved checkpoint instead of training")
     p.add_argument("--eval-games",   type=int, default=100)
+    p.add_argument("--display",      action="store_true",
+                   help="display a saved checkpoint in a pygame window")
     args = p.parse_args()
 
     if args.eval:
