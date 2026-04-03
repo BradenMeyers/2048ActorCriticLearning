@@ -22,7 +22,7 @@ import csv
 import math
 import os
 import time
-from collections import deque
+from collections import deque, Counter
 from tqdm import tqdm
 
 import numpy as np
@@ -404,13 +404,14 @@ def evaluate(checkpoint_path: str = "a2c_checkpoint.pt", n_games: int = 100):
                 mask   = action_mask(game).to(DEVICE)
                 policy, _ = net(state, mask)
                 # At eval time: pick the highest-probability legal move (greedy)
+                # TODO here look at mcts for improving the move selection.
                 action = policy.argmax().item()
                 game.step(Move(action))
 
             scores.append(game.score)
             max_tiles.append(game.max_tile)
 
-    from collections import Counter
+    
     tile_dist = Counter(max_tiles)
 
     print(f"\n{'='*45}")
@@ -495,13 +496,13 @@ def main():
     p.add_argument("--eval",         action="store_true",
                    help="evaluate a saved checkpoint instead of training")
     p.add_argument("--eval-games",   type=int, default=100)
-    p.add_argument("--display",      type=int, default=2,
+    p.add_argument("--display",      type=int, default=-1,
                    help="display a saved checkpoint in a pygame window")
     args = p.parse_args()
 
     if args.eval:
         evaluate(args.checkpoint, args.eval_games)
-    elif args.display:
+    elif args.display != -1:
         net = ActorCritic().to(DEVICE)
         checkpoint = torch.load(args.checkpoint, map_location=DEVICE)
         net.load_state_dict(checkpoint["model_state_dict"])
