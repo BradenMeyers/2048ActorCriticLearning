@@ -154,7 +154,7 @@ def run_gui(seed=None):
                     sys.exit()
 
                 move = KEY_MAP.get(event.key)
-                if move and not game.is_over:
+                if move is not None and not game.is_over:
                     game.step(move)
                     if game.won() and not won_once:
                         won_once = True
