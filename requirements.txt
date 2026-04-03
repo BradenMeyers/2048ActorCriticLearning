@@ -2,3 +2,5 @@ numpy
 pygame
 torch
 tqdm
+pandas
+matplotlib

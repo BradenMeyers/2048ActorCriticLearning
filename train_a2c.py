@@ -9,6 +9,7 @@ Usage
     python train_a2c.py                        # train with defaults
     python train_a2c.py --episodes 5000        # more training
     python train_a2c.py --eval                 # evaluate a saved checkpoint
+    python train_a2c.py --display              # watch a saved checkpoint play
 
 Files produced
 --------------
@@ -168,7 +169,8 @@ def compute_reward(moved: bool, merge_reward: int, game: Game2048) -> float:
         return -1.0     # small penalty for illegal move (shouldn't happen with masking)
 
     log_merge = math.log2(merge_reward + 1)
-    empty_bonus = 0.1 * game.n_empty
+    empty_bonus = 0.1 * game.n_empty # Should i reward this more? 
+    # TODO could add reward here for max tile
     return log_merge + empty_bonus
 
 
@@ -221,6 +223,17 @@ def train(
     net       = ActorCritic().to(DEVICE)
     optimizer = optim.Adam(net.parameters(), lr=lr)
 
+    # Resume from checkpoint if one exists
+    start_episode = 1
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+        net.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_episode = checkpoint["episode"] + 1
+        print(f"Resumed from checkpoint — continuing from episode {start_episode}\n")
+    else:
+        print("No checkpoint found — starting fresh\n")
+
     # Rolling window for tracking progress
     recent_scores    = deque(maxlen=100)
     recent_max_tiles = deque(maxlen=100)
@@ -228,7 +241,7 @@ def train(
     log_rows = []
     t_start  = time.time()
 
-    for episode in range(1, n_episodes + 1):
+    for episode in range(start_episode, start_episode + n_episodes):
 
         game = Game2048()
 
@@ -427,7 +440,7 @@ def display_agent(net: ActorCritic, n_games: int = 5):
     clock = pygame.time.Clock()
 
     for i in range(n_games):
-        game = Game2048(seed=i)
+        game = Game2048()
         while not game.is_over:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -455,8 +468,13 @@ def display_agent(net: ActorCritic, n_games: int = 5):
                         screen.blit(text, text_rect)
 
             pygame.display.flip()
-            clock.tick(10)  # slow down for visibility
-
+            clock.tick(30)  # slow down for visibility
+        # Print stats of game
+        print(f"\n{'='*45}")
+        print(f"  A2C Agent Display")
+        print(f"{'='*45}")
+        print(f"  Final score   : {game.score}")
+        print(f"  Max tile      : {game.max_tile}")
     pygame.quit()
 
 # ===== CLI
