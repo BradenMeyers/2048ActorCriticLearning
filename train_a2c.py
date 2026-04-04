@@ -13,8 +13,8 @@ Usage
 
 Files produced
 --------------
-    a2c_checkpoint.pt   – saved model weights
-    a2c_log.csv         – per-episode training stats
+    a2c_checkpoint.pt   - saved model weights
+    a2c_log.csv         - per-episode training stats
 """
 
 import argparse
@@ -169,7 +169,7 @@ def compute_reward(moved: bool, merge_reward: int, game: Game2048) -> float:
         return -1.0     # small penalty for illegal move (shouldn't happen with masking)
 
     log_merge = math.log2(merge_reward + 1)
-    empty_bonus = 0.1 * game.n_empty # Should i reward this more? 
+    empty_bonus = 0.6 * game.n_empty # Should i reward this more? 
     # TODO could add reward here for max tile
     return log_merge + empty_bonus
 
