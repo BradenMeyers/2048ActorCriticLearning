@@ -46,21 +46,29 @@ N_ACTIONS     = 4           # UP DOWN LEFT RIGHT
 
 # = state encoder
 
-def board_to_tensor(board: np.ndarray) -> torch.Tensor:
-    """
-    Convert a 4x4 numpy board to a (256,) one-hot float tensor.
+# def board_to_tensor(board: np.ndarray) -> torch.Tensor:
+#     """
+#     Convert a 4x4 numpy board to a (256,) one-hot float tensor.
 
-    Each cell becomes a one-hot vector of length 16:
-        empty  → index 0
-        tile 2 → index 1
-        tile 4 → index 2
-        ...
-        tile 2^15 → index 15
-    """
-    indices = np.where(board > 0, np.log2(board.clip(1)).astype(np.int32), 0).clip(0, N_TILE_LEVELS - 1)
-    state = np.zeros((16, N_TILE_LEVELS), dtype=np.float32)
-    state[np.arange(16), indices.flatten()] = 1.0
-    return torch.from_numpy(state.flatten())
+#     Each cell becomes a one-hot vector of length 16:
+#         empty  → index 0
+#         tile 2 → index 1
+#         tile 4 → index 2
+#         ...
+#         tile 2^15 → index 15
+#     """
+#     indices = np.where(board > 0, np.log2(board.clip(1)).astype(np.int32), 0).clip(0, N_TILE_LEVELS - 1)
+#     state = np.zeros((16, N_TILE_LEVELS), dtype=np.float32)
+#     state[np.arange(16), indices.flatten()] = 1.0
+#     return torch.from_numpy(state.flatten())
+
+def board_to_tensor(board):
+    state = np.zeros((1, 4, 4), dtype=np.float32)
+    for r in range(4):
+        for c in range(4):
+            val = board[r, c]
+            state[0, r, c] = math.log2(val) / 15.0 if val > 0 else 0.0
+    return torch.tensor(state, dtype=torch.float32)
 
 
 def action_mask(game: Game2048) -> torch.Tensor:
@@ -77,39 +85,54 @@ def action_mask(game: Game2048) -> torch.Tensor:
 
 
 # = network
-
 class ActorCritic(nn.Module):
-    """
-    Shared-trunk network with two heads:
-        - Actor head  → policy π(a|s), probability over 4 moves
-        - Critic head → value V(s), expected future return
-
-    Architecture:
-        Input (256) → Linear(512) → ReLU → Linear(512) → ReLU
-                                                ↓
-                              ┌─────────────────┤
-                              ↓                 ↓
-                         Actor head        Critic head
-                         Linear(4)         Linear(1)
-                         (logits)          (scalar)
-    """
-
-    def __init__(self, state_dim: int = STATE_DIM, hidden: int = 512):
+    def __init__(self):
         super().__init__()
-
-        # Shared trunk — learns board representations useful to both heads
         self.trunk = nn.Sequential(
-            nn.Linear(state_dim, hidden),
+            nn.Conv2d(1, 64, kernel_size=2),   # 64 filters, 2x2 kernel
             nn.ReLU(),
-            nn.Linear(hidden, hidden),
+            nn.Conv2d(64, 128, kernel_size=2), # 128 filters
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(128 * 2 * 2, 256),
             nn.ReLU(),
         )
+        self.actor_head  = nn.Linear(256, 4)
+        self.critic_head = nn.Linear(256, 1)
 
-        # Actor head — outputs raw logits (NOT probabilities yet)
-        self.actor_head = nn.Linear(hidden, N_ACTIONS)
 
-        # Critic head — outputs a single scalar value estimate
-        self.critic_head = nn.Linear(hidden, 1)
+# class ActorCritic(nn.Module):
+#     """
+#     Shared-trunk network with two heads:
+#         - Actor head  → policy π(a|s), probability over 4 moves
+#         - Critic head → value V(s), expected future return
+
+#     Architecture:
+#         Input (256) → Linear(512) → ReLU → Linear(512) → ReLU
+#                                                 ↓
+#                               ┌─────────────────┤
+#                               ↓                 ↓
+#                          Actor head        Critic head
+#                          Linear(4)         Linear(1)
+#                          (logits)          (scalar)
+#     """
+
+#     def __init__(self, state_dim: int = STATE_DIM, hidden: int = 512):
+#         super().__init__()
+
+#         # Shared trunk — learns board representations useful to both heads
+#         self.trunk = nn.Sequential(
+#             nn.Linear(state_dim, hidden),
+#             nn.ReLU(),
+#             nn.Linear(hidden, hidden),
+#             nn.ReLU(),
+#         )
+
+#         # Actor head — outputs raw logits (NOT probabilities yet)
+#         self.actor_head = nn.Linear(hidden, N_ACTIONS)
+
+#         # Critic head — outputs a single scalar value estimate
+#         self.critic_head = nn.Linear(hidden, 1)
 
     def forward(self, state: torch.Tensor, mask: torch.Tensor = None):
         """
