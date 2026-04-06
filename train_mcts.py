@@ -1,20 +1,20 @@
 """
-A2C (Advantage Actor-Critic) for 2048
+AC MCTS ( MCTS with Actor-Critic) for 2048
 ==
-Trains a neural network to play 2048 using the Advantage Actor-Critic algorithm.
+Trains a neural network to play 2048 using the MCTS with Actor-Critic algorithm.
 
 Usage
 -----
     pip install torch numpy
-    python train_a2c.py                        # train with defaults
-    python train_a2c.py --episodes 5000        # more training
-    python train_a2c.py --eval                 # evaluate a saved checkpoint
-    python train_a2c.py --display 2            # watch agent play at 2 fps
+    python train_mcts.py                        # train with defaults
+    python train_mcts.py --episodes 5000        # more training
+    python train_mcts.py --eval                 # evaluate a saved checkpoint
+    python train_mcts.py --display 2            # watch agent play at 2 fps
 
 Files produced
 --------------
-    a2c_checkpoint.pt   - saved model weights
-    a2c_log.csv         - per-episode training stats
+    mcts_checkpoint.pt   - saved model weights
+    mcts_log.csv         - per-episode training stats
 
 Architecture
 ------------
@@ -29,6 +29,7 @@ import math
 import os
 import time
 from collections import deque, Counter
+from typing import Optional
 
 import numpy as np
 import torch
@@ -44,6 +45,252 @@ from game import Game2048, Move
 DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 N_ACTIONS = 4   # UP DOWN LEFT RIGHT
 
+class MCTSNode:
+    # Represents a node in the MCTS tree.
+    def __init__(self, prior: np.ndarray, mask: np.ndarray):
+        self.prior = prior          # Prior policy from the actor head (4,)
+        self.mask  = mask           # Legal move mask (4,)
+        self._N = np.zeros(N_ACTIONS)              # Visit count
+        self._W   = np.zeros(N_ACTIONS)          # Total value of all visits (for computing Q)
+        # self.children    = [None] * N_ACTIONS  # Child nodes for each action
+
+    @property
+    def total_visits(self) -> int:
+        return int(self._N.sum())
+
+    @property
+    def N(self) -> np.ndarray:
+        return self._N
+    
+    @property
+    def W(self) -> np.ndarray:
+        return self._W
+    
+    @property
+    def Q(self) -> np.ndarray:
+        # Q = W / N, but handle division by zero for unvisited actions
+        with np.errstate(divide='ignore', invalid='ignore'):
+            Q = np.where(self._N > 0, self._W / self._N, 0.0)
+        return Q
+    
+    def update(self, action: int, value: float):
+        """
+        Update visit count and total value for the given action.
+        Called during backpropagation after a simulation.
+
+        value is the return from the simulation (e.g. final score or critic value).
+        We want to maximize this, so we add it to W.
+        """
+        self._N[action] += 1  # Increment visit count for this action
+        self._W[action] += value # Add the simulation return to total value for this action
+
+
+    def select_action(self, c: float) -> int:
+        """
+        Select action using PUCT formula: Q + c * P * sqrt(N_parent) / (1 + N_child)
+
+        Q = W / N for each action (0 if N=0)
+        P = prior policy from actor head
+        N_parent = total visits to this node
+        N_child = visits to each child action
+
+        c controls exploration vs exploitation:
+            c=0 → greedy (always pick highest Q)
+            c→∞ → pure exploration (pick according to prior P)
+
+        """
+        total_visits = self.total_visits
+        exploration = c * self.prior * np.sqrt(total_visits + 1) / (1 + self.N)
+
+        puct = np.where(self.mask, self.Q + exploration, -np.inf)  # Mask illegal moves with -inf
+
+        return int(np.argmax(puct))  # Return the action index with highest PUCT score
+    
+    def get_policy(self, eta: float) -> np.ndarray:
+        """
+        Convert visit counts to a policy distribution for training the actor head.
+
+        eta = 1, porportion to visit counts (π(a) = N(a) / N_total)
+        eta → 0, becomes one-hot on most visited action (π(a) = 1 if N(a) = max else 0)
+        """
+        if eta == float('inf'):
+            # Deterministic: one-hot on most visited action
+            policy = np.zeros(N_ACTIONS, dtype=np.float32)
+            best_action = np.argmax(self.N)
+            policy[best_action] = 1.0
+            return policy
+        
+        counts = self.N ** eta
+        total_counts = counts.sum()
+        if total_counts == 0:
+            # No visits, return uniform distribution over legal moves
+            policy = np.where(self.mask, 1.0 / self.mask.sum(), 0.0)
+            return policy / policy.sum()  # Normalize to sum to 1
+        return counts / total_counts  # Normalize to get probabilities
+    
+
+
+class MCTS:
+    """
+    Monte Carlo Tree Search guided by a trained ActorCritic network.
+ 
+    The network serves two roles:
+        - Actor (policy head): prior π(a|s) biases which branches to explore
+        - Critic (value head):  V(s) evaluates leaf nodes without rollouts
+ 
+    2048 is stochastic — after each move a random tile spawns. We handle
+    this by sampling one tile placement per simulation (rather than averaging
+    over all placements). This introduces some variance but keeps the tree
+    simple and is standard practice for stochastic MCTS.
+    """
+ 
+    def __init__(
+        self,
+        net,                          # trained ActorCritic
+        device,                       # torch device
+        c:              float = 1.5,  # exploration constant in PUCT
+        n_simulations:  int   = 100,  # simulations per move
+        gamma:          float = 0.99, # discount factor for backprop returns
+        empty_threshold: int  = 6,    # use greedy above this many empty cells
+    ):
+        self.net              = net
+        self.device           = device
+        self.c                = c
+        self.n_simulations    = n_simulations
+        self.gamma            = gamma
+        self.empty_threshold  = empty_threshold
+ 
+        # Tree: maps board_key → MCTSNode
+        # Board key is a tuple of 16 ints (flattened board)
+        self.tree: dict[tuple, MCTSNode] = {}
+ 
+    def _board_key(self, board: np.ndarray) -> tuple:
+        # So we can find similar board states. 
+        """Hashable representation of a board state."""
+        return tuple(board.flatten().tolist())
+ 
+    def _get_prior_and_value(self, game: Game2048):
+        """
+        Run one forward pass of the network to get:
+            prior : (4,) policy distribution πθ(a|s)
+            value : scalar V(s)
+            mask  : (4,) bool — legal moves
+        """
+ 
+        state = board_to_tensor(game.board).to(self.device)
+        mask  = action_mask(game).to(self.device)
+ 
+        with torch.no_grad():
+            policy, value = self.net(state, mask)
+ 
+        prior = policy.cpu().numpy()
+        val   = value.cpu().item()
+        msk   = mask.cpu().numpy()
+        return prior, val, msk
+ 
+    def _expand(self, game: Game2048) -> float:
+        """
+        Expand a new leaf node:
+            1. Run network to get prior and value
+            2. Add node to tree
+            3. Return value estimate for backprop
+ 
+        Returns the critic's value estimate V(s).
+        """
+        key = self._board_key(game.board)
+        prior, value, mask = self._get_prior_and_value(game)
+        self.tree[key] = MCTSNode(prior=prior, mask=mask)
+        return value
+ 
+    def _simulate(self, root_game: Game2048) -> None:
+        """
+        Run one full simulation: select → expand → evaluate → backprop.
+
+        We work on clones of the game state so the real game is untouched.
+        """
+        game = Game2048.from_board(root_game.board, root_game.score)
+        path = []   # list of (board_key, action, shaped_reward) triples for backprop
+
+        # ---- SELECTION: walk tree using PUCT until we hit an unexpanded node ----
+        while True:
+            key = self._board_key(game.board)
+
+            if game.is_over:
+                # Terminal node — value is 0 (no future reward)
+                value = 0.0
+                break
+
+            if key not in self.tree:
+                # Unexpanded leaf — expand and get value from critic
+                value = self._expand(game)
+                break
+
+            # Node exists — select action using PUCT
+            node   = self.tree[key]
+            action = node.select_action(self.c)
+
+            # Take action in cloned game, record shaped reward for this step
+            move = Move(action)
+            moved, merge_reward = game.step(move)
+            reward = compute_reward(moved, merge_reward, game)
+            path.append((key, action, reward))
+
+            if not moved:
+                # This shouldn't happen with a good mask but handle gracefully
+                value = 0.0
+                print("Warning: MCTS selected an illegal move. Ending simulation.")
+                break
+
+        # ---- BACKPROPAGATION: accumulate discounted returns along the path ----
+        # G starts at the leaf critic estimate (or 0 for terminal/error),
+        # then each step folds in its own reward: G = r + γ·G
+        G = value
+        for key, action, reward in reversed(path):
+            G = reward + self.gamma * G
+            self.tree[key].update(action, G)
+    
+    def get_policy(self, game: Game2048, eta: float = 1.0) -> np.ndarray:
+        """
+        Run search and return the full πMCTS distribution.
+        Used during AlphaZero-style training to get policy targets.
+ 
+        eta=1   → proportional to visit counts (exploration during training)
+        eta=inf → greedy (best play at eval time)
+        """
+        self.tree = {}
+        for _ in range(self.n_simulations):
+            self._simulate(game)
+ 
+        root_key = self._board_key(game.board)
+        if root_key not in self.tree:
+            # Fallback: uniform over legal moves
+            mask = np.array([m in game.available_moves() for m in Move])
+            policy = mask.astype(float)
+            return policy / policy.sum()
+ 
+        return self.tree[root_key].get_policy(eta)
+
+    def search(self, game: Game2048) -> int:
+        """
+        Return the best action for the current position.
+
+        When the board has more than empty_threshold open cells, the many
+        possible tile spawns dilute the tree — different simulations almost
+        never revisit the same state, so MCTS adds little over a single
+        network pass.  In that regime we just return the greedy argmax.
+        Once the board tightens up (few empty cells → fewer spawn outcomes →
+        higher chance of tree hits), we run the full MCTS search.
+        """
+        if game.n_empty > self.empty_threshold:
+            # Greedy: one forward pass, no tree search
+            state = board_to_tensor(game.board).to(self.device)
+            mask  = action_mask(game).to(self.device)
+            with torch.no_grad():
+                policy, _ = self.net(state, mask)
+            return int(policy.argmax().item())
+
+        policy = self.get_policy(game, eta=float("inf"))
+        return int(np.argmax(policy))
 
 # = state encoder
 
@@ -249,7 +496,7 @@ def compute_reward(moved: bool, merge_reward: int, game: Game2048) -> float:
     log_merge = math.log2(merge_reward + 1)
     empty_bonus = 0.6 * game.n_empty # Should i reward this more? 
     # TODO could add reward here for max tile
-    return log_merge + empty_bonus
+    return (log_merge + empty_bonus) * 0.1 # scale down to keep rewards in a reasonable range
 
 
 # = training loop
@@ -280,8 +527,8 @@ def train(
     entropy_coef:    float = 0.01,
     value_coef:      float = 0.5,
     max_steps:       int   = 5000,
-    checkpoint_path: str   = "a2c_checkpoint.pt",
-    log_path:        str   = "a2c_log.csv",
+    checkpoint_path: str   = "mcts_checkpoint.pt",
+    log_path:        str   = "mcts_log.csv",
     log_every:       int   = 50,
 ):
     print(f"Training on: {DEVICE}")
@@ -330,7 +577,7 @@ def train(
             move           = Move(action.item())
             moved, raw_rew = game.step(move)        # Move and get score delta (merge reward)
             reward         = compute_reward(moved, raw_rew, game) # Reward for this transition. 
-            # reward         = compute_reward(moved, raw_rew, game, episode, total_episodes) # Reward for this transition. 
+            # reward         = compute_reward(moved, raw_rew, game, episode, total_episodes) # Reward with ciriculum learing
 
             states.append(state_tensor)
             actions.append(action)
@@ -360,9 +607,11 @@ def train(
         # Detach values so critic gradient doesn't flow through the advantage
         advantages = returns_t - values_t.detach()
 
-        # Normalize returns and advantages for better training stability
+        # Normalize advantages ONLY — not returns.
+        # Normalizing returns destroys the scale the critic needs to learn V(s).
+        # Normalizing advantages just stabilizes the actor gradient.
         if len(advantages) > 1:
-            returns_t   = (returns_t   - returns_t.mean())   / (returns_t.std()   + 1e-8)
+            # returns_t   = (returns_t   - returns_t.mean())   / (returns_t.std()   + 1e-8)
             advantages  = (advantages  - advantages.mean())  / (advantages.std()  + 1e-8)
 
         # Actor loss: push up probability of actions with positive advantage
@@ -437,7 +686,7 @@ def train(
 
 # = evaluation
 
-def evaluate(checkpoint_path: str = "a2c_checkpoint.pt", n_games: int = 100):
+def evaluate(checkpoint_path: str = "mcts_checkpoint.pt", n_games: int = 100):
     if not os.path.exists(checkpoint_path):
         print(f"No checkpoint found at {checkpoint_path}. Train first.")
         return
@@ -464,19 +713,55 @@ def evaluate(checkpoint_path: str = "a2c_checkpoint.pt", n_games: int = 100):
             scores.append(game.score)
             max_tiles.append(game.max_tile)
 
-    tile_dist = Counter(max_tiles)
-    print(f"\n{'='*45}")
-    print(f"  A2C Agent — {n_games} games")
-    print(f"{'='*45}")
-    print(f"  Mean score      : {np.mean(scores):>10.1f}")
-    print(f"  Median score    : {np.median(scores):>10.1f}")
-    print(f"  Max score       : {np.max(scores):>10}")
-    print(f"  Win rate (≥2048): {sum(t >= 2048 for t in max_tiles)/n_games*100:>7.1f}%")
-    print(f"\n  Max tile distribution:")
-    for tile in sorted(tile_dist):
-        pct = tile_dist[tile] / n_games * 100
-        bar = "█" * int(pct / 2)
-        print(f"    {tile:>5}: {bar:<40} {pct:.1f}%")
+    _print_results("A2C Greedy", n_games, scores, max_tiles)
+
+
+def evaluate_mcts(
+    checkpoint_path: str = "mcts_checkpoint.pt",
+    n_games:         int = 100,
+    n_simulations:   int = 100,
+    c:               float = 1.5,
+):
+    """
+    MCTS eval — uses tree search guided by the trained network.
+ 
+    At each move, runs n_simulations of MCTS using:
+        - Policy head as prior to bias exploration (PUCT formula)
+        - Value head to evaluate leaf nodes (no random rollouts needed)
+ 
+    Then picks the most visited action (greedy over visit counts).
+ 
+    This is stronger than greedy eval because MCTS looks ahead through
+    many simulated futures rather than just one network forward pass.
+    """
+    if not os.path.exists(checkpoint_path):
+        print(f"No checkpoint found at {checkpoint_path}. Train first.")
+        return
+ 
+    net = ActorCritic().to(DEVICE)
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    net.load_state_dict(checkpoint["model_state_dict"])
+    net.eval()
+
+    # TODO tune n simulations based on time
+    mcts = MCTS(net=net, device=DEVICE, c=c, n_simulations=n_simulations)
+ 
+    print(f"Evaluating {n_games} games with MCTS ({n_simulations} sims/move)...")
+    scores, max_tiles = [], []
+ 
+    for i in range(n_games):
+        game = Game2048(seed=i)
+        while not game.is_over:
+            action = mcts.search(game)
+            game.step(Move(action))
+ 
+        scores.append(game.score)
+        max_tiles.append(game.max_tile)
+ 
+        if (i + 1) % 10 == 0:
+            print(f"  [{i+1}/{n_games}] score={game.score} max={game.max_tile}")
+ 
+    _print_results(f"A2C + MCTS ({n_simulations} sims)", n_games, scores, max_tiles)
 
 
 def evaluate_uniform(n_games: int = 100):
@@ -492,23 +777,10 @@ def evaluate_uniform(n_games: int = 100):
         scores.append(game.score)
         max_tiles.append(game.max_tile)
 
-    tile_dist = Counter(max_tiles)
-    print(f"\n{'='*45}")
-    print(f"  Uniform Random — {n_games} games")
-    print(f"{'='*45}")
-    print(f"  Mean score      : {np.mean(scores):>10.1f}")
-    print(f"  Median score    : {np.median(scores):>10.1f}")
-    print(f"  Max score       : {np.max(scores):>10}")
-    print(f"  Win rate (≥2048): {sum(t >= 2048 for t in max_tiles)/n_games*100:>7.1f}%")
-    print(f"\n  Max tile distribution:")
-    for tile in sorted(tile_dist):
-        pct = tile_dist[tile] / n_games * 100
-        bar = "█" * int(pct / 2)
-        print(f"    {tile:>5}: {bar:<40} {pct:.1f}%")
+    _print_results("Uniform Random", n_games, scores, max_tiles)
 
-
-def display_agent(checkpoint_path: str = "a2c_checkpoint.pt",
-                  n_games: int = 1, speed: int = 2):
+def display_agent(checkpoint_path: str = "mcts_checkpoint.pt",
+                  n_games: int = 1, speed: int = 2, type: str = "greedy"):
     import pygame
 
     if not os.path.exists(checkpoint_path):
@@ -533,6 +805,7 @@ def display_agent(checkpoint_path: str = "a2c_checkpoint.pt",
         64: (246,94,59),  128: (237,207,114), 256: (237,204,97),
         512: (237,200,80), 1024: (237,197,63), 2048: (237,194,46),
     }
+    mcts = MCTS(net=net, device=DEVICE, c=1.5, n_simulations=100)
 
     for game_i in range(n_games):
         game = Game2048()
@@ -546,7 +819,10 @@ def display_agent(checkpoint_path: str = "a2c_checkpoint.pt",
                 state  = board_to_tensor(game.board).to(DEVICE)
                 mask   = action_mask(game).to(DEVICE)
                 policy, _ = net(state, mask)
-                action = policy.argmax().item() # Greedy action
+                if type == "greedy":
+                    action = policy.argmax().item() # Greedy action
+                elif type == "mcts":
+                    action = mcts.search(game)
             game.step(Move(action))
 
             screen.fill((187, 173, 160))
@@ -570,6 +846,23 @@ def display_agent(checkpoint_path: str = "a2c_checkpoint.pt",
 
     pygame.quit()
 
+def _print_results(label: str, n_games: int, scores: list, max_tiles: list):
+    """Shared result printer for all eval modes."""
+    from collections import Counter
+    tile_dist = Counter(max_tiles)
+    print(f"\n{'='*45}")
+    print(f"  {label} — {n_games} games")
+    print(f"{'='*45}")
+    print(f"  Mean score      : {np.mean(scores):>10.1f}")
+    print(f"  Median score    : {np.median(scores):>10.1f}")
+    print(f"  Max score       : {np.max(scores):>10}")
+    print(f"  Win rate (≥2048): {sum(t >= 2048 for t in max_tiles)/n_games*100:>7.1f}%")
+    print(f"\n  Max tile distribution:")
+    for tile in sorted(tile_dist):
+        pct = tile_dist[tile] / n_games * 100
+        bar = "█" * int(pct / 2)
+        print(f"    {tile:>5}: {bar:<40} {pct:.1f}%")
+
 # ===== CLI
 
 # TODO: Should look at gamma because we care about future rewards a lot
@@ -584,20 +877,22 @@ def main():
     p.add_argument("--entropy-coef", type=float, default=0.01)
     p.add_argument("--value-coef",   type=float, default=0.5)
     p.add_argument("--log-every",    type=int,   default=50)
-    p.add_argument("--checkpoint",   default="a2c_checkpoint.pt")
-    p.add_argument("--eval",         action="store_true")
-    p.add_argument("--eval-uniform", action="store_true")
-    p.add_argument("--eval-games",   type=int,   default=100)
+    p.add_argument("--checkpoint",   default="mcts_checkpoint.pt")
+    p.add_argument("--eval",         type=int, default=-1, help="num of games to evaluate")
+    p.add_argument("--type",         type=str, default="greedy")
     p.add_argument("--display",      type=int,   default=-1,
                    help="watch agent play at DISPLAY fps (e.g. --display 4)")
     args = p.parse_args()
 
-    if args.eval:
-        evaluate(args.checkpoint, args.eval_games)
-    elif args.eval_uniform:
-        evaluate_uniform(args.eval_games)
+    if args.eval >= 0:
+        if args.type.lower() == "greedy":
+            evaluate(args.checkpoint, args.eval)
+        elif args.type.lower() == "uniform":
+            evaluate_uniform(args.eval)
+        elif args.type.lower() == "mcts":
+            evaluate_mcts(args.checkpoint, args.eval)
     elif args.display != -1:
-        display_agent(args.checkpoint, speed=args.display)
+        display_agent(args.checkpoint, speed=args.display, type=args.type)
     else:
         train(
             n_episodes      = args.episodes,
