@@ -57,16 +57,10 @@ def board_to_tensor(board: np.ndarray) -> torch.Tensor:
         ...
         tile 2^15 → index 15
     """
-    state = np.zeros((4, 4, N_TILE_LEVELS), dtype=np.float32)
-    for r in range(4):
-        for c in range(4):
-            val = board[r, c]
-            idx = int(math.log2(val)) if val > 0 else 0
-            if idx >= N_TILE_LEVELS:
-                print(f"Warning: tile value {val} exceeds max level {N_TILE_LEVELS-1}. Clamping.")
-                idx = min(idx, N_TILE_LEVELS - 1)   # safety clamp
-            state[r, c, idx] = 1.0
-    return torch.tensor(state.flatten(), dtype=torch.float32)
+    indices = np.where(board > 0, np.log2(board.clip(1)).astype(np.int32), 0).clip(0, N_TILE_LEVELS - 1)
+    state = np.zeros((16, N_TILE_LEVELS), dtype=np.float32)
+    state[np.arange(16), indices.flatten()] = 1.0
+    return torch.from_numpy(state.flatten())
 
 
 def action_mask(game: Game2048) -> torch.Tensor:
@@ -178,7 +172,10 @@ def compute_reward(moved: bool, merge_reward: int, game: Game2048) -> float:
 
 def compute_returns(rewards: list, last_value: float, gamma: float) -> list:
     """
-    Compute discounted returns G_t = r_t + γ*r_{t+1} + γ²*r_{t+2} + ...
+    REWARD TO GO:
+    TODO: Add the the GAE
+
+    Compute discounted returns G_t = r_t + y*r_{t+1} + γ²*r_{t+2} + ...
 
     We work backwards from the end of the episode.
     last_value is the critic's estimate of V(s_T) — the bootstrapped value
@@ -190,7 +187,8 @@ def compute_returns(rewards: list, last_value: float, gamma: float) -> list:
     G = last_value
     for r in reversed(rewards):
         G = r + gamma * G
-        returns.insert(0, G)
+        returns.append(G)
+    returns.reverse()
     return returns
 
 
@@ -248,32 +246,34 @@ def train(
         # ---- collect one full episode of experience ----
         states, actions, rewards, values, log_probs, masks = [], [], [], [], [], []
 
+        # TODO what is max steps. Are we hitting it often?
+        # This could prevent us from getting to a point where we learn how to play
+        # with high tiles
         for _ in range(max_steps):
             if game.is_over:
                 break
 
-            state_tensor = board_to_tensor(game.board).to(DEVICE)
-            mask_tensor  = action_mask(game).to(DEVICE)
-
+            state_tensor = board_to_tensor(game.board)
+            mask_tensor  = action_mask(game)
             # WHAT IS MY INITIAL policy. Is it just uniform?
 
             # Forward pass — get policy and value for current state
-            policy, value = net(state_tensor, mask_tensor)
+            policy, value = net(state_tensor.to(DEVICE), mask_tensor.to(DEVICE))
 
             # Sample action from policy distribution
             dist   = torch.distributions.Categorical(policy)
-            action = dist.sample()
+            action = dist.sample() # Sample from the policy. 
 
             # Take the action in the game
             move           = Move(action.item())
-            moved, raw_rew = game.step(move)
-            reward         = compute_reward(moved, raw_rew, game)
+            moved, raw_rew = game.step(move)        # Move and get score delta (merge reward)
+            reward         = compute_reward(moved, raw_rew, game) # Reward for this transition. 
 
             # Store everything we'll need for the update
             states.append(state_tensor)
             actions.append(action)
             rewards.append(reward)
-            values.append(value.squeeze())
+            values.append(value.squeeze()) # why do we have to squeeze here?
             log_probs.append(dist.log_prob(action))
             masks.append(mask_tensor)
 
@@ -282,28 +282,32 @@ def train(
         # Bootstrap value from last state (0 if game ended, V(s_T) if we hit max_steps)
         last_value = 0.0
         if not game.is_over and len(states) > 0:
+            print("Episode hit max steps without ending. Bootstrapping last value from critic.")
+            print("Warning this will cause issues in the training because we wont be learning how to play with higher tiles.")
             with torch.no_grad():
                 last_mask = action_mask(game).to(DEVICE)
                 last_state = board_to_tensor(game.board).to(DEVICE)
-                _, last_v  = net(last_state, last_mask)
+                _, last_v  = net(last_state, last_mask)  # Calcuate the value for this last state
                 last_value = last_v.item()
 
-        returns   = compute_returns(rewards, last_value, gamma)
+        returns   = compute_returns(rewards, last_value, gamma) # Reward credit assignment to previous states
         returns_t = torch.tensor(returns, dtype=torch.float32).to(DEVICE)
         values_t  = torch.stack(values)
         log_probs_t = torch.stack(log_probs)
 
         # Advantage = how much better was this outcome vs what the critic expected?
+        # TODO what does detach mean?
         # Detach values so critic gradient doesn't flow through the advantage
         advantages = returns_t - values_t.detach()
 
+        # Normalize returns and advantages for better training stability
         if len(advantages) > 1:
             returns_t   = (returns_t   - returns_t.mean())   / (returns_t.std()   + 1e-8)
             advantages  = (advantages  - advantages.mean())  / (advantages.std()  + 1e-8)
 
         # ---- compute losses ----
 
-        # Actor loss: negative log-prob weighted by advantage
+        # Actor loss: negative log-prob weighted by advantage (element wise)
         actor_loss = -(log_probs_t * advantages).mean()
 
         # Critic loss
@@ -311,7 +315,7 @@ def train(
 
         # Entropy estimate from stored log_probs — no need to re-run forward passes.
         # -E[log π(a)] is a valid per-step entropy estimate for the sampled actions.
-        # Re-running forward passes (previous bug) doubled compute and created a
+        # Re-running forward passes doubled compute and created a
         # disconnected computation graph.
         entropy = -log_probs_t.mean()
 
@@ -405,7 +409,7 @@ def evaluate(checkpoint_path: str = "a2c_checkpoint.pt", n_games: int = 100):
                 policy, _ = net(state, mask)
                 # At eval time: pick the highest-probability legal move (greedy)
                 # TODO here look at mcts for improving the move selection.
-                action = policy.argmax().item()
+                action = policy.argmax().item() # Greedy action for now. Need to add mcts
                 game.step(Move(action))
 
             scores.append(game.score)
@@ -416,6 +420,37 @@ def evaluate(checkpoint_path: str = "a2c_checkpoint.pt", n_games: int = 100):
 
     print(f"\n{'='*45}")
     print(f"  A2C Agent — {n_games} games")
+    print(f"{'='*45}")
+    print(f"  Mean score   : {np.mean(scores):>10.1f}")
+    print(f"  Median score : {np.median(scores):>10.1f}")
+    print(f"  Max score    : {np.max(scores):>10}")
+    print(f"  Win rate (≥2048): {sum(t >= 2048 for t in max_tiles)/n_games*100:.1f}%")
+    print(f"\n  Max tile distribution:")
+    for tile in sorted(tile_dist):
+        pct = tile_dist[tile] / n_games * 100
+        bar = "█" * int(pct / 2)
+        print(f"    {tile:>5}: {bar:<40} {pct:.1f}%")
+
+
+def evaluate_uniform(n_games: int = 100):
+    """
+    Baseline: uniform random policy over legal moves only.
+    """
+    import random
+    scores, max_tiles = [], []
+
+    for i in range(n_games):
+        game = Game2048(seed=i)
+        while not game.is_over:
+            moves = game.available_moves()
+            game.step(random.choice(moves))
+        scores.append(game.score)
+        max_tiles.append(game.max_tile)
+
+    tile_dist = Counter(max_tiles)
+
+    print(f"\n{'='*45}")
+    print(f"  Uniform Random — {n_games} games")
     print(f"{'='*45}")
     print(f"  Mean score   : {np.mean(scores):>10.1f}")
     print(f"  Median score : {np.median(scores):>10.1f}")
@@ -451,7 +486,7 @@ def display_agent(net: ActorCritic, n_games: int = 5, speed: int = 2):
             state  = board_to_tensor(game.board).to(DEVICE)
             mask   = action_mask(game).to(DEVICE)
             policy, _ = net(state, mask)
-            action = policy.argmax().item()
+            action = policy.argmax().item() # Greedy action
             game.step(Move(action))
 
             # Render the game board
@@ -495,6 +530,8 @@ def main():
     p.add_argument("--checkpoint",   default="a2c_checkpoint.pt")
     p.add_argument("--eval",         action="store_true",
                    help="evaluate a saved checkpoint instead of training")
+    p.add_argument("--eval-uniform", action="store_true",
+                   help="evaluate the uniform random baseline")
     p.add_argument("--eval-games",   type=int, default=100)
     p.add_argument("--display",      type=int, default=-1,
                    help="display a saved checkpoint in a pygame window")
@@ -502,6 +539,8 @@ def main():
 
     if args.eval:
         evaluate(args.checkpoint, args.eval_games)
+    elif args.eval_uniform:
+        evaluate_uniform(args.eval_games)
     elif args.display != -1:
         net = ActorCritic().to(DEVICE)
         checkpoint = torch.load(args.checkpoint, map_location=DEVICE)

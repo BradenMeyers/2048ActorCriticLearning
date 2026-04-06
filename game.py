@@ -40,7 +40,7 @@ class Game2048:
     state = game.board.copy()           # snapshot
     game2 = Game2048.from_board(state)  # clone
     """
-
+    # TODO make the game score and reward show at the top of the board when printed.
     SIZE = 4
 
     # ------------------------------------------------------------------ init
@@ -98,8 +98,8 @@ class Game2048:
 
         Returns
         -------
-        moved  : bool  – False if the board didn't change (illegal move)
-        reward : int   – points earned this step (sum of merged tiles)
+        moved  : bool  - False if the board didn't change (illegal move)
+        reward : int   - points earned this step (sum of merged tiles)
         """
         if self._over:
             return False, 0
