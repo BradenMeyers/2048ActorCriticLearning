@@ -2,6 +2,15 @@
 Actor Critic Policy learning for 2048 game
 
 
+Thoughts:
+[] GAE to test different bias and variance estimates
+[] MCTS how good it performs online vs without out it and number of sims
+[] CNN vs linear
+[] Different state representations
+
+I just wonder if you could just run with the greedy policy until you get to a point where there are fewer open spaces where the sim is actually going to do more for you because then there are less spawn options and you could start getting repeat counts. This would speed it up significantly and get similar results i hope
+
+
 # Uniform Policy Results
 
 ## 🎲 Uniform Random — 1,000 Games

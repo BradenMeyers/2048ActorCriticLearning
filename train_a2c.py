@@ -249,7 +249,7 @@ def compute_reward(moved: bool, merge_reward: int, game: Game2048) -> float:
     log_merge = math.log2(merge_reward + 1)
     empty_bonus = 0.6 * game.n_empty # Should i reward this more? 
     # TODO could add reward here for max tile
-    return log_merge + empty_bonus
+    return (log_merge + empty_bonus) * 0.1 # scale down to keep rewards in a reasonable range
 
 
 # = training loop
@@ -360,9 +360,11 @@ def train(
         # Detach values so critic gradient doesn't flow through the advantage
         advantages = returns_t - values_t.detach()
 
-        # Normalize returns and advantages for better training stability
+        # Normalize advantages ONLY — not returns.
+        # Normalizing returns destroys the scale the critic needs to learn V(s).
+        # Normalizing advantages just stabilizes the actor gradient.
         if len(advantages) > 1:
-            returns_t   = (returns_t   - returns_t.mean())   / (returns_t.std()   + 1e-8)
+            # returns_t   = (returns_t   - returns_t.mean())   / (returns_t.std()   + 1e-8)
             advantages  = (advantages  - advantages.mean())  / (advantages.std()  + 1e-8)
 
         # Actor loss: push up probability of actions with positive advantage
@@ -373,7 +375,8 @@ def train(
 
         # Entropy: -E[log π(a)] from sampled log_probs
         # Prevents policy collapsing to always picking one move
-        entropy = -log_probs_t.mean()
+        # entropy = -log_probs_t.mean() # TODO check this
+        entropy = dist.entropy().mean()  # exact H(π) = -Σ π(a) log π(a)
 
         # Combined loss
         loss = actor_loss + value_coef * critic_loss - entropy_coef * entropy

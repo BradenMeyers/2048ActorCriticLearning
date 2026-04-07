@@ -30,6 +30,8 @@ import os
 import time
 from collections import deque, Counter
 from typing import Optional
+import random
+import copy
 
 import numpy as np
 import torch
@@ -38,17 +40,21 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from game import Game2048, Move
+import time
 
 
 # ===== constants
 
 DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 N_ACTIONS = 4   # UP DOWN LEFT RIGHT
+N_TILE_LEVELS = 16          # levels 0..15
+STATE_DIM     = 4 * 4 * N_TILE_LEVELS   # 256
 
 class MCTSNode:
     # Represents a node in the MCTS tree.
     def __init__(self, prior: np.ndarray, mask: np.ndarray):
-        self.prior = prior          # Prior policy from the actor head (4,)
+        self.original_prior = prior.copy()  # clean network output — used as base for noise
+        self.prior = prior          # working prior (may be noisy)
         self.mask  = mask           # Legal move mask (4,)
         self._N = np.zeros(N_ACTIONS)              # Visit count
         self._W   = np.zeros(N_ACTIONS)          # Total value of all visits (for computing Q)
@@ -152,6 +158,9 @@ class MCTS:
         n_simulations:  int   = 100,  # simulations per move
         gamma:          float = 0.99, # discount factor for backprop returns
         empty_threshold: int  = 6,    # use greedy above this many empty cells
+        dir_alpha:        float = 0.3,  # Dirichlet concentration (lower = more noise)
+        dir_epsilon:      float = 0.25, # fraction of prior replaced by noise
+        terminal_penalty: float = 0.0,  # negative reward added when a simulation hits game-over
     ):
         self.net              = net
         self.device           = device
@@ -159,6 +168,9 @@ class MCTS:
         self.n_simulations    = n_simulations
         self.gamma            = gamma
         self.empty_threshold  = empty_threshold
+        self.dir_alpha        = dir_alpha
+        self.dir_epsilon      = dir_epsilon
+        self.terminal_penalty = terminal_penalty
  
         # Tree: maps board_key → MCTSNode
         # Board key is a tuple of 16 ints (flattened board)
@@ -216,8 +228,8 @@ class MCTS:
             key = self._board_key(game.board)
 
             if game.is_over:
-                # Terminal node — value is 0 (no future reward)
-                value = 0.0
+                # Terminal node — apply penalty so MCTS actively avoids losing
+                value = self.terminal_penalty
                 break
 
             if key not in self.tree:
@@ -249,25 +261,49 @@ class MCTS:
             G = reward + self.gamma * G
             self.tree[key].update(action, G)
     
-    def get_policy(self, game: Game2048, eta: float = 1.0) -> np.ndarray:
+    def reset_tree(self):
+        """Clear the tree. Call once at the start of each game/episode."""
+        self.tree = {}
+
+    def get_policy(self, game: Game2048, eta: float = 1.0,
+                   add_noise: bool = False) -> np.ndarray:
         """
         Run search and return the full πMCTS distribution.
-        Used during AlphaZero-style training to get policy targets.
- 
-        eta=1   → proportional to visit counts (exploration during training)
-        eta=inf → greedy (best play at eval time)
+
+        The tree is NOT reset between moves — nodes carry over their visit
+        counts from earlier in the game. If the current root was visited
+        during a previous move's simulations, those visits give it a warm
+        start, so each new search effectively builds on prior work.
+
+        Call reset_tree() once per episode to clear state between games.
+
+        eta=1        → proportional to visit counts (exploration during training)
+        eta=inf      → greedy (best play at eval time)
+        add_noise=True → inject Dirichlet noise into the root prior, applied
+                         fresh each call from original_prior so noise never
+                         accumulates across moves.
         """
-        self.tree = {}
+        root_key = self._board_key(game.board)
+
+        # Only expand if this state hasn't been visited before
+        if root_key not in self.tree:
+            self._expand(game)
+
+        if add_noise and root_key in self.tree:
+            root = self.tree[root_key]
+            noise = np.random.dirichlet([self.dir_alpha] * N_ACTIONS)
+            # Always apply noise to original_prior so it doesn't compound
+            root.prior = (1 - self.dir_epsilon) * root.original_prior + self.dir_epsilon * noise
+
         for _ in range(self.n_simulations):
             self._simulate(game)
- 
-        root_key = self._board_key(game.board)
+
         if root_key not in self.tree:
             # Fallback: uniform over legal moves
             mask = np.array([m in game.available_moves() for m in Move])
             policy = mask.astype(float)
             return policy / policy.sum()
- 
+
         return self.tree[root_key].get_policy(eta)
 
     def search(self, game: Game2048) -> int:
@@ -296,27 +332,43 @@ class MCTS:
 
 def board_to_tensor(board: np.ndarray) -> torch.Tensor:
     """
-    Convert 4x4 numpy board to a (1, 4, 4) float tensor using log2 encoding.
+    Convert a 4x4 numpy board to a (256,) one-hot float tensor.
 
-    Each cell → log2(value) / 15.0, normalised to [0, 1].
-    Empty cells → 0.0.
-
-    Why log2 instead of one-hot?
-        One-hot treats each tile level as an independent category — the network
-        has no idea 256 and 512 are related. Log2 encoding gives tiles ordinal
-        meaning: equal adjacent cells are always exactly 1/15 apart in value,
-        so the CNN can learn the merge condition (two equal neighbours) as a
-        single consistent filter regardless of which tile level it is.
-
-    Shape: (1, 4, 4) = (channels, H, W).
-        forward() adds the batch dim → (1, 1, 4, 4) before Conv2d.
+    Each cell becomes a one-hot vector of length 16:
+        empty  → index 0
+        tile 2 → index 1
+        tile 4 → index 2
+        ...
+        tile 2^15 → index 15
     """
-    state = np.zeros((1, 4, 4), dtype=np.float32)
-    for r in range(4):
-        for c in range(4):
-            val = board[r, c]
-            state[0, r, c] = math.log2(val) / 15.0 if val > 0 else 0.0
-    return torch.tensor(state, dtype=torch.float32)
+    indices = np.where(board > 0, np.log2(board.clip(1)).astype(np.int32), 0).clip(0, N_TILE_LEVELS - 1)
+    state = np.zeros((16, N_TILE_LEVELS), dtype=np.float32)
+    state[np.arange(16), indices.flatten()] = 1.0
+    return torch.from_numpy(state.flatten())
+
+# def board_to_tensor(board: np.ndarray) -> torch.Tensor:
+#     """
+#     Convert 4x4 numpy board to a (1, 4, 4) float tensor using log2 encoding.
+
+#     Each cell → log2(value) / 15.0, normalised to [0, 1].
+#     Empty cells → 0.0.
+
+#     Why log2 instead of one-hot?
+#         One-hot treats each tile level as an independent category — the network
+#         has no idea 256 and 512 are related. Log2 encoding gives tiles ordinal
+#         meaning: equal adjacent cells are always exactly 1/15 apart in value,
+#         so the CNN can learn the merge condition (two equal neighbours) as a
+#         single consistent filter regardless of which tile level it is.
+
+#     Shape: (1, 4, 4) = (channels, H, W).
+#         forward() adds the batch dim → (1, 1, 4, 4) before Conv2d.
+#     """
+#     state = np.zeros((1, 4, 4), dtype=np.float32)
+#     for r in range(4):
+#         for c in range(4):
+#             val = board[r, c]
+#             state[0, r, c] = math.log2(val) / 15.0 if val > 0 else 0.0
+#     return torch.tensor(state, dtype=torch.float32)
 
 
 def action_mask(game: Game2048) -> torch.Tensor:
@@ -332,107 +384,132 @@ def action_mask(game: Game2048) -> torch.Tensor:
     return mask
 
 
-# = network
-class ActorCritic(nn.Module):
-    """
-    CNN shared-trunk actor-critic.
-
-    Why CNN?
-        The merge condition — two equal adjacent tiles — is a 2x1 spatial
-        pattern. A Conv2d filter can represent this directly. A flat linear
-        network has to learn the same pattern implicitly across all 256 inputs,
-        which takes much longer and has to relearn it for every tile level.
-
-    Architecture:
-        Input (1, 4, 4)
-          → Conv2d(1→64,   kernel=2) → ReLU   # local 2x2 patterns
-          → Conv2d(64→128, kernel=2) → ReLU   # higher-level structure
-          → Flatten → Linear(512→256) → ReLU
-               ↓
-        ┌──────┴──────┐
-        ↓             ↓
-     Actor head   Critic head
-     Linear(4)    Linear(1)
-     softmax      raw scalar
-     → π(a|s)     → V(s)
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        self.trunk = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=2),    # (1,4,4) → (64,3,3)
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=2),  # (64,3,3) → (128,2,2)
-            nn.ReLU(),
-            nn.Flatten(),                        # → (512,)
-            nn.Linear(128 * 2 * 2, 256),
-            nn.ReLU(),
-        )
-
-        self.actor_head  = nn.Linear(256, N_ACTIONS)
-        self.critic_head = nn.Linear(256, 1)
-
-
+# # = network
 # class ActorCritic(nn.Module):
 #     """
-#     Shared-trunk network with two heads:
-#         - Actor head  → policy π(a|s), probability over 4 moves
-#         - Critic head → value V(s), expected future return
+#     CNN shared-trunk actor-critic.
+
+#     Why CNN?
+#         The merge condition — two equal adjacent tiles — is a 2x1 spatial
+#         pattern. A Conv2d filter can represent this directly. A flat linear
+#         network has to learn the same pattern implicitly across all 256 inputs,
+#         which takes much longer and has to relearn it for every tile level.
 
 #     Architecture:
-#         Input (256) → Linear(512) → ReLU → Linear(512) → ReLU
-#                                                 ↓
-#                               ┌─────────────────┤
-#                               ↓                 ↓
-#                          Actor head        Critic head
-#                          Linear(4)         Linear(1)
-#                          (logits)          (scalar)
+#         Input (1, 4, 4)
+#           → Conv2d(1→64,   kernel=2) → ReLU   # local 2x2 patterns
+#           → Conv2d(64→128, kernel=2) → ReLU   # higher-level structure
+#           → Flatten → Linear(512→256) → ReLU
+#                ↓
+#         ┌──────┴──────┐
+#         ↓             ↓
+#      Actor head   Critic head
+#      Linear(4)    Linear(1)
+#      softmax      raw scalar
+#      → π(a|s)     → V(s)
 #     """
 
-#     def __init__(self, state_dim: int = STATE_DIM, hidden: int = 512):
+#     def __init__(self):
 #         super().__init__()
 
-#         # Shared trunk — learns board representations useful to both heads
 #         self.trunk = nn.Sequential(
-#             nn.Linear(state_dim, hidden),
+#             nn.Conv2d(1, 64, kernel_size=2),    # (1,4,4) → (64,3,3)
 #             nn.ReLU(),
-#             nn.Linear(hidden, hidden),
+#             nn.Conv2d(64, 128, kernel_size=2),  # (64,3,3) → (128,2,2)
+#             nn.ReLU(),
+#             nn.Flatten(),                        # → (512,)
+#             nn.Linear(128 * 2 * 2, 256),
 #             nn.ReLU(),
 #         )
 
-#         # Actor head — outputs raw logits (NOT probabilities yet)
-#         self.actor_head = nn.Linear(hidden, N_ACTIONS)
+#         self.actor_head  = nn.Linear(256, N_ACTIONS)
+#         self.critic_head = nn.Linear(256, 1)
 
-#         # Critic head — outputs a single scalar value estimate
-#         self.critic_head = nn.Linear(hidden, 1)
+#     def forward(self, state: torch.Tensor, mask: torch.Tensor = None):
+#         """
+#         Parameters
+#         ----------
+#         state : (1, 4, 4) from board_to_tensor — (channels, H, W)
+#                 Conv2d needs (batch, C, H, W) = (1, 1, 4, 4), added here.
+#         mask  : (4,) bool — True = legal move
+
+#         Returns
+#         -------
+#         policy : (4,)  probability over actions  (batch dim squeezed)
+#         value  : (1,)  scalar state value        (batch dim squeezed)
+#         """
+#         # (1, 4, 4) → (1, 1, 4, 4): add batch dimension for Conv2d
+#         if state.dim() == 3:
+#             state = state.unsqueeze(0)
+
+#         features = self.trunk(state)          # → (1, 256)
+#         logits   = self.actor_head(features)  # → (1, 4)
+
+#         # Mask illegal moves — unsqueeze mask to broadcast over batch dim
+#         if mask is not None:
+#             logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
+
+#         policy = F.softmax(logits, dim=-1).squeeze(0)  # → (4,)
+#         value  = self.critic_head(features).squeeze(0) # → (1,)
+
+#         return policy, value
+
+class ActorCritic(nn.Module):
+    """
+    Shared-trunk network with two heads:
+        - Actor head  → policy π(a|s), probability over 4 moves
+        - Critic head → value V(s), expected future return
+
+    Architecture:
+        Input (256) → Linear(512) → ReLU → Linear(512) → ReLU
+                                                ↓
+                              ┌─────────────────┤
+                              ↓                 ↓
+                         Actor head        Critic head
+                         Linear(4)         Linear(1)
+                         (logits)          (scalar)
+    """
+
+    def __init__(self, state_dim: int = STATE_DIM, hidden: int = 512):
+        super().__init__()
+
+        # Shared trunk — learns board representations useful to both heads
+        self.trunk = nn.Sequential(
+            nn.Linear(state_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+        )
+
+        # Actor head — outputs raw logits (NOT probabilities yet)
+        self.actor_head = nn.Linear(hidden, N_ACTIONS)
+
+        # Critic head — outputs a single scalar value estimate
+        self.critic_head = nn.Linear(hidden, 1)
 
     def forward(self, state: torch.Tensor, mask: torch.Tensor = None):
         """
         Parameters
         ----------
-        state : (1, 4, 4) from board_to_tensor — (channels, H, W)
-                Conv2d needs (batch, C, H, W) = (1, 1, 4, 4), added here.
-        mask  : (4,) bool — True = legal move
+        state : (batch, 256) or (256,) float tensor
+        mask  : (batch, 4) or (4,) bool tensor — True = legal move
+                If provided, illegal moves get -inf logits before softmax.
 
         Returns
         -------
-        policy : (4,)  probability over actions  (batch dim squeezed)
-        value  : (1,)  scalar state value        (batch dim squeezed)
+        policy : (batch, 4) action probability distribution
+        value  : (batch, 1) state value estimate
         """
-        # (1, 4, 4) → (1, 1, 4, 4): add batch dimension for Conv2d
-        if state.dim() == 3:
-            state = state.unsqueeze(0)
+        features = self.trunk(state)
 
-        features = self.trunk(state)          # → (1, 256)
-        logits   = self.actor_head(features)  # → (1, 4)
+        logits = self.actor_head(features)
 
-        # Mask illegal moves — unsqueeze mask to broadcast over batch dim
+        # Mask illegal moves — set their logits to -inf so softmax → 0
         if mask is not None:
-            logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
+            logits = logits.masked_fill(~mask, float("-inf"))
 
-        policy = F.softmax(logits, dim=-1).squeeze(0)  # → (4,)
-        value  = self.critic_head(features).squeeze(0) # → (1,)
+        policy = F.softmax(logits, dim=-1)
+        value  = self.critic_head(features)
 
         return policy, value
 
@@ -684,100 +761,264 @@ def train(
     return net
 
 
-# = evaluation
+def train_mcts(
+    n_episodes:       int   = 2000,
+    gamma:            float = 0.99,
+    lr:               float = 3e-4,
+    value_coef:       float = 0.5,
+    max_steps:        int   = 5000,
+    n_simulations:    int   = 50,
+    collect_every:    int   = 10,   # episodes to collect before each training phase
+    n_grad_steps:     int   = 3,    # gradient updates per collection round
+    minibatch_size:   int   = 512,  # steps sampled per gradient update
+    terminal_penalty: float = 0.0,  # reward added at game-over in training and MCTS
+    save_dir:         str   = "",   # directory to write checkpoint and log into
+    checkpoint_path:  str   = "mcts_checkpoint.pt",
+    log_path:         str   = "mcts_log.csv",
+    log_every:        int   = 50,
+):
+    """
+    AlphaZero-style training loop with replay buffer and a frozen behavior network.
 
-def evaluate(checkpoint_path: str = "mcts_checkpoint.pt", n_games: int = 100):
+    Each round:
+      1. COLLECT: play collect_every episodes using target_net (frozen) inside
+         MCTS. Store (state, mask, pi_mcts, return) for every step.
+      2. TRAIN: sample random minibatches from the buffer and do n_grad_steps
+         gradient updates on net (the live training network).
+      3. SYNC: copy net → target_net so the next round collects with the
+         freshly trained weights.
+
+    Why a separate target_net?
+        If we train net while also using it for MCTS, the data distribution
+        shifts under every gradient step. Keeping target_net frozen for a full
+        collection round stabilises the training targets.
+
+    Actor loss: cross-entropy(pi_mcts, pi_net) = -sum(pi_mcts * log(pi_net))
+    Critic loss: MSE(V(s), G_t)
+    """
+    # Resolve output paths — prefix with save_dir if provided
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        checkpoint_path = os.path.join(save_dir, os.path.basename(checkpoint_path))
+        log_path        = os.path.join(save_dir, os.path.basename(log_path))
+
+    print(f"Training MCTS on: {DEVICE}")
+    print(f"Episodes: {n_episodes}  gamma={gamma}  lr={lr}  sims={n_simulations}")
+    print(f"collect_every={collect_every}  n_grad_steps={n_grad_steps}  minibatch={minibatch_size}")
+    print(f"checkpoint -> {checkpoint_path}\n")
+
+    net       = ActorCritic().to(DEVICE)
+    optimizer = optim.Adam(net.parameters(), lr=lr)
+
+    start_episode = 1
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+        net.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_episode = checkpoint["episode"] + 1
+        print(f"Resumed from checkpoint -- continuing from episode {start_episode}\n")
+    else:
+        print("No checkpoint found -- starting fresh\n")
+
+    # Frozen behavior network used by MCTS during data collection.
+    # Only synced from net at the end of each round.
+    target_net = copy.deepcopy(net)
+    target_net.eval()
+    mcts = MCTS(net=target_net, device=DEVICE, c=1.5, n_simulations=n_simulations,
+                gamma=gamma, terminal_penalty=terminal_penalty)
+
+    recent_scores    = deque(maxlen=100)
+    recent_max_tiles = deque(maxlen=100)
+    log_rows         = []
+    t_start          = time.time()
+
+    end_episode = start_episode + n_episodes
+    for round_start in range(start_episode, end_episode, collect_every):
+        round_end = min(round_start + collect_every, end_episode)
+
+        # ---- 1. COLLECT --------------------------------------------------------
+        # Play collect_every episodes and accumulate (state, mask, pi, return).
+        buffer = []
+
+        for episode in range(round_start, round_end):
+            game = Game2048()
+            mcts.reset_tree()  # fresh tree per episode; reused across moves within it
+            episode_data = []  # (state_tensor, mask_tensor, pi_target, reward)
+
+            for _ in range(max_steps):
+                if game.is_over:
+                    break
+
+                state_tensor = board_to_tensor(game.board).to(DEVICE)
+                mask_tensor  = action_mask(game).to(DEVICE)
+
+                # MCTS on the frozen target_net — no gradient tracking needed
+                pi     = mcts.get_policy(game, eta=1.0, add_noise=True)
+                target = torch.tensor(pi, dtype=torch.float32)  # keep on CPU until batched
+
+                action = int(torch.multinomial(target, 1).item())
+                moved, merge_reward = game.step(Move(action))
+                reward = (math.log2(merge_reward+1) if merge_reward > 0 else 0.0) \
+                       + 0.1 * game.n_empty
+
+                episode_data.append((state_tensor.cpu(), mask_tensor.cpu(), target, reward))
+
+            if not episode_data:
+                continue
+
+            # Add terminal penalty to the last step if the game ended naturally
+            if game.is_over and terminal_penalty != 0.0:
+                s, m, pi, r = episode_data[-1]
+                episode_data[-1] = (s, m, pi, r + terminal_penalty)
+
+            # Bootstrap critic value if the episode hit max_steps
+            last_value = 0.0
+            if not game.is_over:
+                with torch.no_grad():
+                    last_state = board_to_tensor(game.board).to(DEVICE)
+                    last_mask  = action_mask(game).to(DEVICE)
+                    _, last_v  = net(last_state, last_mask)
+                    last_value = last_v.item()
+
+            rewards = [r for *_, r in episode_data]
+            returns = compute_returns(rewards, last_value, gamma)
+
+            for i, (state, mask, pi, _) in enumerate(episode_data):
+                buffer.append((state, mask, pi, returns[i]))
+
+            recent_scores.append(game.score)
+            recent_max_tiles.append(game.max_tile)
+
+        if not buffer:
+            continue
+
+        # ---- 2. TRAIN ----------------------------------------------------------
+        # Multiple minibatch gradient steps on the collected data.
+        actor_loss_sum = critic_loss_sum = 0.0
+
+        for _ in range(n_grad_steps):
+            batch = random.sample(buffer, min(minibatch_size, len(buffer)))
+
+            states_t  = torch.stack([s for s, m, pi, r in batch]).to(DEVICE)   # (B, STATE_DIM)
+            masks_t   = torch.stack([m for s, m, pi, r in batch]).to(DEVICE)   # (B, 4)
+            pis_t     = torch.stack([pi for s, m, pi, r in batch]).to(DEVICE)  # (B, 4)
+            returns_t = torch.tensor(
+                [r for s, m, pi, r in batch], dtype=torch.float32, device=DEVICE
+            )                                                                    # (B,)
+
+            policy_out, value_out = net(states_t, masks_t)   # (B,4), (B,1)
+
+            log_pi      = torch.log(policy_out + 1e-8)        # (B, 4)
+            actor_loss  = -(pis_t * log_pi).sum(dim=-1).mean()
+            critic_loss = F.mse_loss(value_out.squeeze(-1), returns_t)
+
+            loss = actor_loss + value_coef * critic_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
+            optimizer.step()
+
+            actor_loss_sum  += actor_loss.item()
+            critic_loss_sum += critic_loss.item()
+
+        # ---- 3. SYNC -----------------------------------------------------------
+        # Copy trained weights into the frozen behavior network for next round.
+        target_net.load_state_dict(net.state_dict())
+
+        # ---- LOGGING -----------------------------------------------------------
+        last_episode = round_end - 1
+        if last_episode % log_every < collect_every or last_episode + 1 >= end_episode:
+            avg_score    = np.mean(recent_scores)
+            avg_max_tile = np.mean(recent_max_tiles)
+            elapsed      = time.time() - t_start
+            avg_actor    = actor_loss_sum  / n_grad_steps
+            avg_critic   = critic_loss_sum / n_grad_steps
+            print(
+                f"Ep {last_episode:>5} | "
+                f"AvgScore {avg_score:>8.0f} | "
+                f"AvgMaxTile {avg_max_tile:>6.0f} | "
+                f"ActorLoss {avg_actor:>7.4f} | "
+                f"CriticLoss {avg_critic:>7.4f} | "
+                f"Time {elapsed:>6.0f}s"
+            )
+            log_rows.append({
+                "episode":      last_episode,
+                "avg_score":    round(avg_score, 1),
+                "avg_max_tile": round(avg_max_tile, 1),
+                "actor_loss":   round(avg_actor, 5),
+                "critic_loss":  round(avg_critic, 5),
+                "elapsed_s":    round(elapsed, 1),
+            })
+
+        # ---- SAVE (every round) ------------------------------------------------
+        torch.save({
+            "model_state_dict":     net.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "episode":              last_episode,
+            "config": {
+                "gamma":          gamma,
+                "lr":             lr,
+                "value_coef":     value_coef,
+                "n_simulations":  n_simulations,
+                "collect_every":  collect_every,
+                "n_grad_steps":   n_grad_steps,
+                "minibatch_size": minibatch_size,
+            }
+        }, checkpoint_path)
+
+        if log_rows:
+            with open(log_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=log_rows[0].keys())
+                writer.writeheader()
+                writer.writerows(log_rows)
+
+    print(f"\nModel saved -> {checkpoint_path}")
+    print(f"Log saved   -> {log_path}")
+    return net
+
+
+# = evaluation
+def evaluate(checkpoint_path: str = "mcts_checkpoint.pt", type: str = "greedy", n_games: int = 100, n_simulations: int = 100, c: float = 1.5):
+    start_time = time.time()
     if not os.path.exists(checkpoint_path):
         print(f"No checkpoint found at {checkpoint_path}. Train first.")
         return
-
+    
+    print(f"Evaluating {n_games} games with {type} algorithm...")
+    
     net = ActorCritic().to(DEVICE)
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
     net.load_state_dict(checkpoint["model_state_dict"])
     net.eval()
-
-    print(f"Evaluating {n_games} games with trained A2C agent...")
     scores, max_tiles = [], []
+     # TODO tune n simulations based on time
+    mcts = MCTS(net=net, device=DEVICE, c=c, n_simulations=n_simulations)
+
 
     with torch.no_grad():
         for i in range(n_games):
             game = Game2048(seed=i)
+            mcts.reset_tree()
             while not game.is_over:
                 state  = board_to_tensor(game.board).to(DEVICE)
                 mask   = action_mask(game).to(DEVICE)
                 policy, _ = net(state, mask)
-                # At eval time: pick the highest-probability legal move (greedy)
-                # TODO here look at mcts for improving the move selection.
-                action = policy.argmax().item() # Greedy action for now. Need to add mcts
+                if type == "greedy":
+                    action = policy.argmax().item() # Greedy action 
+                elif type == "mcts":
+                    # This still uses the greedy 
+                    action = mcts.search(game)
+                elif type == "uniform":
+                    action = game.step(random.choice(game.available_moves()))
+                
                 game.step(Move(action))
             scores.append(game.score)
             max_tiles.append(game.max_tile)
+    
 
-    _print_results("A2C Greedy", n_games, scores, max_tiles)
-
-
-def evaluate_mcts(
-    checkpoint_path: str = "mcts_checkpoint.pt",
-    n_games:         int = 100,
-    n_simulations:   int = 100,
-    c:               float = 1.5,
-):
-    """
-    MCTS eval — uses tree search guided by the trained network.
- 
-    At each move, runs n_simulations of MCTS using:
-        - Policy head as prior to bias exploration (PUCT formula)
-        - Value head to evaluate leaf nodes (no random rollouts needed)
- 
-    Then picks the most visited action (greedy over visit counts).
- 
-    This is stronger than greedy eval because MCTS looks ahead through
-    many simulated futures rather than just one network forward pass.
-    """
-    if not os.path.exists(checkpoint_path):
-        print(f"No checkpoint found at {checkpoint_path}. Train first.")
-        return
- 
-    net = ActorCritic().to(DEVICE)
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-    net.load_state_dict(checkpoint["model_state_dict"])
-    net.eval()
-
-    # TODO tune n simulations based on time
-    mcts = MCTS(net=net, device=DEVICE, c=c, n_simulations=n_simulations)
- 
-    print(f"Evaluating {n_games} games with MCTS ({n_simulations} sims/move)...")
-    scores, max_tiles = [], []
- 
-    for i in range(n_games):
-        game = Game2048(seed=i)
-        while not game.is_over:
-            action = mcts.search(game)
-            game.step(Move(action))
- 
-        scores.append(game.score)
-        max_tiles.append(game.max_tile)
- 
-        if (i + 1) % 10 == 0:
-            print(f"  [{i+1}/{n_games}] score={game.score} max={game.max_tile}")
- 
-    _print_results(f"A2C + MCTS ({n_simulations} sims)", n_games, scores, max_tiles)
-
-
-def evaluate_uniform(n_games: int = 100):
-    """
-    Baseline: uniform random policy over legal moves only.
-    """
-    import random
-    scores, max_tiles = [], []
-    for i in range(n_games):
-        game = Game2048(seed=i)
-        while not game.is_over:
-            game.step(random.choice(game.available_moves()))
-        scores.append(game.score)
-        max_tiles.append(game.max_tile)
-
-    _print_results("Uniform Random", n_games, scores, max_tiles)
+    end_time = time.time()
+    _print_results(type, n_games, scores, max_tiles, end_time - start_time)
 
 def display_agent(checkpoint_path: str = "mcts_checkpoint.pt",
                   n_games: int = 1, speed: int = 2, type: str = "greedy"):
@@ -805,10 +1046,11 @@ def display_agent(checkpoint_path: str = "mcts_checkpoint.pt",
         64: (246,94,59),  128: (237,207,114), 256: (237,204,97),
         512: (237,200,80), 1024: (237,197,63), 2048: (237,194,46),
     }
-    mcts = MCTS(net=net, device=DEVICE, c=1.5, n_simulations=100)
+    mcts = MCTS(net=net, device=DEVICE, c=1.5, n_simulations=2000, empty_threshold=3)
 
     for game_i in range(n_games):
         game = Game2048()
+        mcts.reset_tree()
         while not game.is_over:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -846,7 +1088,7 @@ def display_agent(checkpoint_path: str = "mcts_checkpoint.pt",
 
     pygame.quit()
 
-def _print_results(label: str, n_games: int, scores: list, max_tiles: list):
+def _print_results(label: str, n_games: int, scores: list, max_tiles: list, duration: float = None):
     """Shared result printer for all eval modes."""
     from collections import Counter
     tile_dist = Counter(max_tiles)
@@ -857,6 +1099,8 @@ def _print_results(label: str, n_games: int, scores: list, max_tiles: list):
     print(f"  Median score    : {np.median(scores):>10.1f}")
     print(f"  Max score       : {np.max(scores):>10}")
     print(f"  Win rate (≥2048): {sum(t >= 2048 for t in max_tiles)/n_games*100:>7.1f}%")
+    if duration is not None:
+        print(f"  Duration        : {duration:.2f} s")
     print(f"\n  Max tile distribution:")
     for tile in sorted(tile_dist):
         pct = tile_dist[tile] / n_games * 100
@@ -870,29 +1114,53 @@ def _print_results(label: str, n_games: int, scores: list, max_tiles: list):
 # Do we need a negative reward for losing?
 
 def main():
-    p = argparse.ArgumentParser(description="A2C trainer for 2048")
-    p.add_argument("--episodes",     type=int,   default=2000)
-    p.add_argument("--gamma",        type=float, default=0.99)
-    p.add_argument("--lr",           type=float, default=3e-4)
-    p.add_argument("--entropy-coef", type=float, default=0.01)
-    p.add_argument("--value-coef",   type=float, default=0.5)
-    p.add_argument("--log-every",    type=int,   default=50)
-    p.add_argument("--checkpoint",   default="mcts_checkpoint.pt")
-    p.add_argument("--eval",         type=int, default=-1, help="num of games to evaluate")
-    p.add_argument("--type",         type=str, default="greedy")
-    p.add_argument("--display",      type=int,   default=-1,
+    p = argparse.ArgumentParser(description="A2C / MCTS trainer for 2048")
+    p.add_argument("--mode",          type=str,   default="mcts",
+                   help="training mode: 'a2c' or 'mcts' (default: mcts)")
+    p.add_argument("--episodes",      type=int,   default=2000)
+    p.add_argument("--gamma",         type=float, default=0.99)
+    p.add_argument("--lr",            type=float, default=5e-5)
+    p.add_argument("--entropy-coef",  type=float, default=0.01)
+    p.add_argument("--value-coef",    type=float, default=0.5)
+    p.add_argument("--n-simulations",  type=int,   default=500,
+                   help="MCTS simulations per move (default: 50)")
+    p.add_argument("--collect-every", type=int,   default=10,
+                   help="episodes to collect before each training phase (default: 10)")
+    p.add_argument("--n-grad-steps",  type=int,   default=3,
+                   help="gradient updates per collection round (default: 3)")
+    p.add_argument("--minibatch",     type=int,   default=512,
+                   help="steps sampled per gradient update (default: 512)")
+    p.add_argument("--log-every",     type=int,   default=50)
+    p.add_argument("--dir",           type=str,   default="",
+                   help="directory to save checkpoint and log into (created if needed)")
+    p.add_argument("--terminal-penalty", type=float, default=-25.0,
+                   help="reward added at game-over in training and MCTS sims (default: -25)")
+    p.add_argument("--checkpoint",    default="mcts_checkpoint.pt")
+    p.add_argument("--eval",          type=int,   default=-1, help="num of games to evaluate")
+    p.add_argument("--type",          type=str,   default="greedy")
+    p.add_argument("--display",       type=int,   default=-1,
                    help="watch agent play at DISPLAY fps (e.g. --display 4)")
     args = p.parse_args()
 
     if args.eval >= 0:
-        if args.type.lower() == "greedy":
-            evaluate(args.checkpoint, args.eval)
-        elif args.type.lower() == "uniform":
-            evaluate_uniform(args.eval)
-        elif args.type.lower() == "mcts":
-            evaluate_mcts(args.checkpoint, args.eval)
+        evaluate(args.checkpoint, args.type.lower(), args.eval)
     elif args.display != -1:
         display_agent(args.checkpoint, speed=args.display, type=args.type)
+    elif args.mode.lower() == "mcts":
+        train_mcts(
+            n_episodes        = args.episodes,
+            gamma             = args.gamma,
+            lr                = args.lr,
+            value_coef        = args.value_coef,
+            n_simulations     = args.n_simulations,
+            collect_every     = args.collect_every,
+            n_grad_steps      = args.n_grad_steps,
+            minibatch_size    = args.minibatch,
+            terminal_penalty  = args.terminal_penalty,
+            save_dir          = args.dir,
+            log_every         = args.log_every,
+            checkpoint_path   = args.checkpoint,
+        )
     else:
         train(
             n_episodes      = args.episodes,
