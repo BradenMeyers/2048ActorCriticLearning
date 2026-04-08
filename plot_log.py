@@ -26,8 +26,8 @@ fig.suptitle("A2C Training Metrics", fontsize=14)
 METRICS = [
     ("avg_score",    "Avg Score",       axes[0, 0]),
     ("avg_max_tile", "Avg Max Tile",    axes[0, 1]),
-    ("loss",         "Total Loss",      axes[1, 0]),
-    ("entropy",      "Entropy",         axes[1, 1]),
+    ("actor_loss",       "Actor Loss",      axes[1, 0]),
+    ("critic_loss",      "Critic Loss",         axes[1, 1]),
 ]
 
 for df in dfs:

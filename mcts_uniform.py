@@ -37,14 +37,14 @@ def play_games(
     rollout_depth:  int   = 50,
     c:              float = 160,
     gamma:          float = 0.99,
-    reuse_tree:     bool  = False,
+    clear_tree:     bool  = False,
     seed:           int   = 0,
 ):
     """
     Play n_games with the uniform MCTS agent and print stats.
 
-    reuse_tree=True  — keep the tree between moves within a game (faster, less accurate)
-    reuse_tree=False — reset tree each move (expensive but fully correct)
+    clear_tree=True  — clear the tree between moves within a game (faster, less accurate)
+    clear_tree=False — keep the tree between moves (expensive but fully correct)
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -64,7 +64,7 @@ def play_games(
         mcts.reset_tree()
 
         while not game.is_over:
-            if not reuse_tree:
+            if clear_tree:
                 mcts.reset_tree()
             action = mcts.best_action(game)
             game.step(Move(action))
@@ -104,7 +104,7 @@ def main():
     p.add_argument("--rollout",  type=int,   default=10,  help="random rollout depth for leaf eval")
     p.add_argument("--c",        type=float, default=160, help="PUCT exploration constant")
     p.add_argument("--gamma",    type=float, default=0.99)
-    p.add_argument("--reuse",    action="store_false", help="reuse tree between moves in a game")
+    p.add_argument("--clear-tree",    action="store_true", help="clear tree between moves in a game")
     p.add_argument("--baseline", action="store_true",  help="also run random baseline")
     p.add_argument("--display",  type=int,   default=-1, help="watch agent play at DISPLAY fps")
     p.add_argument("--seed",     type=int,   default=42)
@@ -129,14 +129,14 @@ def main():
         play_random(n_games=args.games, seed=args.seed)
         return
 
-    print(f"Uniform MCTS | sims={args.sims} rollout={args.rollout} c={args.c} reuse_tree={args.reuse}")
+    print(f"Uniform MCTS | sims={args.sims} rollout={args.rollout} c={args.c} clear_tree={args.clear_tree}")
     play_games(
         n_games=args.games,
         n_simulations=args.sims,
         rollout_depth=args.rollout,
         c=args.c,
         gamma=args.gamma,
-        reuse_tree=args.reuse,
+        clear_tree=args.clear_tree,
         seed=args.seed,
     )
 

@@ -6,9 +6,7 @@ Modes
 -----
     train_a2c     Train the CNN A2C agent
     train_mcts    Train the MCTS + LinearActorCritic agent (AlphaZero-style)
-    uniform_mcts  Run the diagnostic uniform-policy MCTS (no network)
-    evaluate      Evaluate a saved checkpoint
-    simulate      Headless simulation with classical agents (random/greedy/expectimax)
+    evaluate      Evaluate an agent (a2c / mcts / uniform / baseline)
     display       Watch an agent play with pygame
     gui           Interactive pygame game (human play)
     terminal      Interactive curses game (human play)
@@ -19,18 +17,26 @@ Examples
     python main.py --mode train_mcts --episodes 5000 --n-simulations 100
     python main.py --mode evaluate --agent a2c --checkpoint a2c_checkpoint.pt
     python main.py --mode evaluate --agent mcts --eval-type mcts --eval-sims 200
+    python main.py --mode evaluate --agent uniform --sims 200 --games 20
+    python main.py --mode evaluate --agent baseline --games 20
     python main.py --mode display --agent mcts --checkpoint mcts_checkpoint.pt --speed 4
-    python main.py --mode uniform_mcts --sims 200 --games 20 --baseline
     python main.py --mode gui
     python main.py --mode terminal
 """
-
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API"
+)
+import os
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 import argparse
 
 import torch
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+DEFAULT_A2C_CHECKPOINT = "pretrained/a2c/a2c_checkpoint.pt"
+DEFAULT_MCTS_CHECKPOINT = "pretrained/mcts/mcts_checkpoint.pt"
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -39,8 +45,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mode", required=True,
-        choices=["train_a2c", "train_mcts", "uniform_mcts",
-                 "evaluate", "display", "gui", "terminal"],
+        choices=["train_a2c", "train_mcts", "evaluate", "display", "gui", "terminal"],
     )
 
     # ── shared ────────────────────────────────────────────────────────────────
@@ -48,10 +53,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--episodes",    type=int,   default=2000)
     p.add_argument("--gamma",       type=float, default=0.99)
     p.add_argument("--lr",          type=float, default=3e-4)
-    p.add_argument("--eval-games",  type=int,   default=100)
-    p.add_argument("--speed",       type=int,   default=4,  help="display fps")
+    p.add_argument("--games",       type=int,   default=100)
+    p.add_argument("--speed",       type=int,   default=0,  help="display fps")
     p.add_argument("--seed",        type=int,   default=None)
     p.add_argument("--n-games",     type=int,   default=1,  help="games to display")
+    p.add_argument("--c",            type=float, default=80.0, help="MCTS exploration constant")
 
     # ── A2C training ──────────────────────────────────────────────────────────
     p.add_argument("--entropy-coef", type=float, default=0.01)
@@ -69,23 +75,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ── eval / display ────────────────────────────────────────────────────────
     p.add_argument("--agent",        default="a2c",
-                   choices=["a2c", "mcts", "uniform"])
+                   choices=["a2c", "mcts", "uniform", "baseline"])
     p.add_argument("--eval-type",    default="greedy",
                    choices=["greedy", "mcts", "random"],
                    help="move selection strategy during evaluation")
-    p.add_argument("--eval-c",       type=float, default=25.0,  help="MCTS c for eval")
     p.add_argument("--eval-sims",    type=int,   default=100,   help="MCTS sims for eval")
     p.add_argument("--display-type", default="greedy",
                    choices=["greedy", "mcts"],
                    help="move selection strategy during display")
 
     # ── uniform MCTS ──────────────────────────────────────────────────────────
-    p.add_argument("--games",    type=int,   default=20)
-    p.add_argument("--sims",     type=int,   default=200)
-    p.add_argument("--rollout",  type=int,   default=10)
-    p.add_argument("--c",        type=float, default=160.0)
-    p.add_argument("--reuse",    action="store_true", help="reuse tree between moves")
-    p.add_argument("--baseline", action="store_true", help="also run random baseline")
+    p.add_argument("--sims",         type=int,   default=200)
+    p.add_argument("--rollout",      type=int,   default=10)
+    p.add_argument("--clear-tree",   action="store_true", help="clear tree between moves")
 
     return p
 
@@ -108,7 +110,7 @@ def main():
     # ── train_a2c ─────────────────────────────────────────────────────────────
     if args.mode == "train_a2c":
         from train_a2c import train
-        ckpt = args.checkpoint or "a2c_checkpoint.pt"
+        ckpt = args.checkpoint or DEFAULT_A2C_CHECKPOINT
         train(
             n_episodes      = args.episodes,
             gamma           = args.gamma,
@@ -122,7 +124,8 @@ def main():
     # ── train_mcts ────────────────────────────────────────────────────────────
     elif args.mode == "train_mcts":
         from train_mcts import train_mcts
-        ckpt = args.checkpoint or "mcts_checkpoint.pt"
+        ckpt = args.checkpoint or DEFAULT_MCTS_CHECKPOINT
+        # TODO add C here
         train_mcts(
             n_episodes        = args.episodes,
             gamma             = args.gamma,
@@ -145,24 +148,24 @@ def main():
         from utils import action_mask
 
         if args.agent == "a2c":
-            from networks import CNNActorCritic
-            ckpt = args.checkpoint or "a2c_checkpoint.pt"
+            from networks import LinearActorCritic
+            ckpt = args.checkpoint or DEFAULT_A2C_CHECKPOINT
             evaluate_checkpoint(
                 checkpoint_path = ckpt,
-                net_class       = CNNActorCritic,
+                net_class       = LinearActorCritic,
                 device          = DEVICE,
                 label           = f"A2C ({args.eval_type})",
-                n_games         = args.eval_games,
+                n_games         = args.games,
             )
 
         elif args.agent == "mcts":
             from networks import LinearActorCritic
             from MCTS import MCTS
-            ckpt = args.checkpoint or "mcts_checkpoint.pt"
+            ckpt = args.checkpoint or DEFAULT_MCTS_CHECKPOINT
             net  = _load_net(LinearActorCritic, ckpt)
 
             if args.eval_type == "mcts":
-                mcts_eval = MCTS(net=net, device=DEVICE, c=args.eval_c,
+                mcts_eval = MCTS(net=net, device=DEVICE, c=args.c,
                                  n_simulations=args.eval_sims)
                 def select_action(game):
                     return mcts_eval.search(game)
@@ -180,16 +183,17 @@ def main():
 
             evaluate_agent(select_action,
                            label=f"MCTS-AC ({args.eval_type})",
-                           n_games=args.eval_games)
+                           n_games=args.games)
 
         elif args.agent == "uniform":
-            from mcts_uniform import play_games, play_random
-            if args.sims == 0:
-                play_random(n_games=args.eval_games, seed=args.seed or 42)
-            else:
-                play_games(n_games=args.eval_games, n_simulations=args.sims,
-                           rollout_depth=args.rollout, c=args.c, gamma=args.gamma,
-                           reuse_tree=args.reuse, seed=args.seed or 42)
+            from mcts_uniform import play_games
+            play_games(n_games=args.games, n_simulations=args.sims,
+                       rollout_depth=args.rollout, c=args.c, gamma=args.gamma,
+                       clear_tree=args.clear_tree, seed=args.seed or 42)
+
+        elif args.agent == "baseline":
+            from mcts_uniform import play_random
+            play_random(n_games=args.games, seed=args.seed or 42)
 
     # ── display ───────────────────────────────────────────────────────────────
     elif args.mode == "display":
@@ -208,9 +212,9 @@ def main():
             )
 
         elif args.agent == "a2c":
-            from networks import CNNActorCritic
-            ckpt = args.checkpoint or "a2c_checkpoint.pt"
-            net  = _load_net(CNNActorCritic, ckpt)
+            from networks import LinearActorCritic
+            ckpt = args.checkpoint or DEFAULT_A2C_CHECKPOINT
+            net  = _load_net(LinearActorCritic, ckpt)
 
             def select_action(game):
                 with torch.no_grad():
@@ -225,12 +229,13 @@ def main():
         elif args.agent == "mcts":
             from networks import LinearActorCritic
             from MCTS import MCTS
-            ckpt = args.checkpoint or "mcts_checkpoint.pt"
+            ckpt = args.checkpoint or DEFAULT_MCTS_CHECKPOINT
             net  = _load_net(LinearActorCritic, ckpt)
 
             if args.display_type == "mcts":
                 mcts_d = MCTS(net=net, device=DEVICE, c=args.c,
                               n_simulations=args.n_simulations, empty_threshold=10)
+                print(f"Displaying MCTS Agent | sims={args.n_simulations} rollout={args.rollout} c={args.c}")
                 def select_action(game):
                     return mcts_d.search(game)
             else:
@@ -243,26 +248,6 @@ def main():
 
             display_agent(select_action, caption="2048 — MCTS Agent",
                           n_games=args.n_games, speed=args.speed)
-
-    # ── uniform_mcts ──────────────────────────────────────────────────────────
-    elif args.mode == "uniform_mcts":
-        from mcts_uniform import play_games, play_random
-        if args.sims == 0:
-            play_random(n_games=args.games, seed=args.seed or 42)
-        else:
-            print(f"Uniform MCTS | sims={args.sims} rollout={args.rollout} c={args.c} reuse={args.reuse}")
-            play_games(
-                n_games       = args.games,
-                n_simulations = args.sims,
-                rollout_depth = args.rollout,
-                c             = args.c,
-                gamma         = args.gamma,
-                reuse_tree    = args.reuse,
-                seed          = args.seed or 42,
-            )
-            if args.baseline:
-                print("\nRunning random baseline for comparison...")
-                play_random(n_games=args.games, seed=args.seed or 42)
 
     # ── gui ───────────────────────────────────────────────────────────────────
     elif args.mode == "gui":

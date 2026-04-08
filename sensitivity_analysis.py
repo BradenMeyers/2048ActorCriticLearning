@@ -34,7 +34,7 @@ def run_config(
     rollout_depth:    int,
     gamma:            float,
     terminal_penalty: float,
-    reuse_tree:       bool,
+    clear_tree:       bool,
     dir_alpha:        float,
     dir_epsilon:      float,
 ) -> dict:
@@ -60,7 +60,7 @@ def run_config(
         mcts.reset_tree()
 
         while not game.is_over:
-            if not reuse_tree:
+            if clear_tree:
                 mcts.reset_tree()
             action = mcts.best_action(game)
             game.step(Move(action))
@@ -85,7 +85,7 @@ def run_config(
         "rollout_depth":   rollout_depth,
         "gamma":           gamma,
         "terminal_penalty": terminal_penalty,
-        "reuse_tree":      reuse_tree,
+        "clear_tree":      clear_tree,
         "dir_alpha":       dir_alpha,
         "dir_epsilon":     dir_epsilon,
     }
@@ -106,7 +106,7 @@ def build_configs(n_games: int, n_simulations: int, seed: int) -> list[dict]:
         rollout_depth=10,
         gamma=0.99,
         terminal_penalty=-10.0,
-        reuse_tree=False,
+        clear_tree=False,
         dir_alpha=0.1,
         dir_epsilon=0.1,
     )
@@ -181,7 +181,7 @@ def run_random_baseline(n_games: int, seed: int) -> dict:
         "tile_dist":        dict(Counter(max_tiles)),
         "elapsed":          time.time() - t0,
         "c": "-", "rollout_depth": "-", "gamma": "-",
-        "terminal_penalty": "-", "reuse_tree": "-",
+        "terminal_penalty": "-", "clear_tree": "-",
         "dir_alpha": "-", "dir_epsilon": "-",
     }
 
@@ -243,7 +243,7 @@ def print_sensitivity_summary(results: list[dict]) -> None:
         "rollout_depth":   [r for r in results if r["label"].startswith("rollout=")],
         "gamma":           [r for r in results if r["label"].startswith("gamma=")],
         "terminal_penalty":[r for r in results if r["label"].startswith("penalty=")],
-        "reuse_tree":      [r for r in results if r["label"].startswith("reuse_tree=")],
+        "clear_tree":      [r for r in results if r["label"].startswith("clear_tree=")],
         "dir_alpha":       [r for r in results if r["label"].startswith("dir_alpha=")],
         "dir_epsilon":     [r for r in results if r["label"].startswith("dir_epsilon=")],
     }

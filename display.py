@@ -59,7 +59,7 @@ def display_agent(
     select_action: Callable[[Game2048], int],
     caption: str = "2048 — Agent",
     n_games: int = 1,
-    speed:   int = 4,
+    speed:   int = 0,
 ) -> None:
     """
     Watch an agent play 2048 in a pygame window.
