@@ -20,9 +20,9 @@ from abc import ABC, abstractmethod
 import numpy as np
 import torch
 
-from game import Game2048, Move
-from utils import N_ACTIONS, ACTION_NAMES
-from utils import sqrt_reward, action_mask
+from runners.game import Game2048, Move
+from runners.utils import N_ACTIONS, ACTION_NAMES
+from runners.utils import sqrt_reward, action_mask
 
 
 # ─────────────────────────────────────── helpers ────────────────────────────

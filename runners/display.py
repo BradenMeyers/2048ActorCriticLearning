@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from game import Game2048, Move
+from runners.game import Game2048, Move
 
 
 TILE_COLORS: dict[int, tuple] = {

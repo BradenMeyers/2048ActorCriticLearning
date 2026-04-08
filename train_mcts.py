@@ -28,11 +28,11 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from game import Game2048, Move
+from runners.game import Game2048, Move
 import time
-from utils import STATE_DIM, compute_returns, circ_reward, sqrt_reward, log_reward, action_mask, N_ACTIONS, ACTION_NAMES, RunningNormalizer
-from networks import LinearActorCritic as ActorCritic
-from MCTS import MCTS
+from runners.utils import STATE_DIM, compute_returns, circ_reward, sqrt_reward, log_reward, action_mask, N_ACTIONS, ACTION_NAMES, RunningNormalizer
+from runners.networks import LinearActorCritic as ActorCritic
+from runners.MCTS import MCTS
 
 # ===== constants
 

@@ -25,8 +25,8 @@ from typing import Callable
 import numpy as np
 import torch
 
-from game import Game2048, Move
-from utils import action_mask
+from runners.game import Game2048, Move
+from runners.utils import action_mask
 
 
 def print_results(

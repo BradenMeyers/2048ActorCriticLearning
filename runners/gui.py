@@ -12,7 +12,7 @@ except ImportError:
     raise SystemExit("pygame is not installed. Run:  pip install pygame")
 
 import sys
-from game import Game2048, Move
+from runners.game import Game2048, Move
 
 # ----------------------------------------------------------------- palette
 

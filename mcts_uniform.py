@@ -23,10 +23,10 @@ import time
 
 import numpy as np
 
-from game import Game2048, Move
-from MCTS import UniformMCTS
-from evaluate import print_results
-from display import display_agent
+from runners.game import Game2048, Move
+from runners.MCTS import UniformMCTS
+from runners.evaluate import print_results
+from runners.display import display_agent
 
 
 # ──────────────────────────────────────────── play ──────────────────────────

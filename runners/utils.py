@@ -2,7 +2,7 @@
 2048 Actor-Critic Utils
 '''
 import math
-from game import Game2048
+from runners.game import Game2048
 import torch
 import torch.nn as nn
 

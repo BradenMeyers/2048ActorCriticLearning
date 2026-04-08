@@ -144,11 +144,11 @@ def main():
 
     # ── evaluate ──────────────────────────────────────────────────────────────
     elif args.mode == "evaluate":
-        from evaluate import evaluate_agent, evaluate_checkpoint
-        from utils import action_mask
+        from runners.evaluate import evaluate_agent, evaluate_checkpoint
+        from runners.utils import action_mask
 
         if args.agent == "a2c":
-            from networks import LinearActorCritic
+            from runners.networks import LinearActorCritic
             ckpt = args.checkpoint or DEFAULT_A2C_CHECKPOINT
             evaluate_checkpoint(
                 checkpoint_path = ckpt,
@@ -159,8 +159,8 @@ def main():
             )
 
         elif args.agent == "mcts":
-            from networks import LinearActorCritic
-            from MCTS import MCTS
+            from runners.networks import LinearActorCritic
+            from runners.MCTS import MCTS
             ckpt = args.checkpoint or DEFAULT_MCTS_CHECKPOINT
             net  = _load_net(LinearActorCritic, ckpt)
 
@@ -197,11 +197,11 @@ def main():
 
     # ── display ───────────────────────────────────────────────────────────────
     elif args.mode == "display":
-        from display import display_agent
-        from utils import action_mask
+        from runners.display import display_agent
+        from runners.utils import action_mask
 
         if args.agent == "uniform":
-            from MCTS import UniformMCTS
+            from runners.MCTS import UniformMCTS
             mcts_u = UniformMCTS(n_simulations=args.sims, rollout_depth=args.rollout,
                                  c=args.c, gamma=args.gamma)
             display_agent(
@@ -212,7 +212,7 @@ def main():
             )
 
         elif args.agent == "a2c":
-            from networks import LinearActorCritic
+            from runners.networks import LinearActorCritic
             ckpt = args.checkpoint or DEFAULT_A2C_CHECKPOINT
             net  = _load_net(LinearActorCritic, ckpt)
 
@@ -227,8 +227,8 @@ def main():
                           n_games=args.n_games, speed=args.speed)
 
         elif args.agent == "mcts":
-            from networks import LinearActorCritic
-            from MCTS import MCTS
+            from runners.networks import LinearActorCritic
+            from runners.MCTS import MCTS
             ckpt = args.checkpoint or DEFAULT_MCTS_CHECKPOINT
             net  = _load_net(LinearActorCritic, ckpt)
 
@@ -251,12 +251,12 @@ def main():
 
     # ── gui ───────────────────────────────────────────────────────────────────
     elif args.mode == "gui":
-        from gui import run_gui
+        from runners.gui import run_gui
         run_gui(seed=args.seed)
 
     # ── terminal ──────────────────────────────────────────────────────────────
     elif args.mode == "terminal":
-        from terminal_ui import run_terminal
+        from runners.terminal_ui import run_terminal
         run_terminal(seed=args.seed)
 
 

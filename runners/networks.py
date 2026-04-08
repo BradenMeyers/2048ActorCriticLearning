@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import N_ACTIONS, STATE_DIM, N_TILE_LEVELS
+from runners.utils import N_ACTIONS, STATE_DIM, N_TILE_LEVELS
 
 # = network
 class CNNActorCritic(nn.Module):

@@ -19,8 +19,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
-from game import Game2048, Move
-from MCTS import UniformMCTS
+from runners.game import Game2048, Move
+from runners.MCTS import UniformMCTS
 
 
 # ─────────────────────────────────────── runner ─────────────────────────────

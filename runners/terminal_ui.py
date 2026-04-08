@@ -7,7 +7,7 @@ Run standalone:  python terminal_ui.py
 
 import curses
 import sys
-from game import Game2048, Move
+from runners.game import Game2048, Move
 
 # Map arrow / wasd keys to Move enum
 _KEY_MAP = {

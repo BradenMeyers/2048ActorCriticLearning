@@ -26,9 +26,9 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from game import Game2048, Move
-from utils import circ_reward, sqrt_reward, log_reward, compute_returns, action_mask
-from networks import LinearActorCritic as ActorCritic
+from runners.game import Game2048, Move
+from runners.utils import circ_reward, sqrt_reward, log_reward, compute_returns, action_mask
+from runners.networks import LinearActorCritic as ActorCritic
 
 # ===== constants
 
