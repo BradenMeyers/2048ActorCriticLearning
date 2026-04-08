@@ -41,7 +41,7 @@ import torch.nn.functional as F
 
 from game import Game2048, Move
 import time
-from utils import STATE_DIM, compute_returns, circ_reward, sqrt_reward, log_reward, action_mask
+from utils import STATE_DIM, compute_returns, circ_reward, sqrt_reward, log_reward, action_mask, N_ACTIONS
 from networks import LinearActorCritic as ActorCritic
 
 # ===== constants
@@ -189,7 +189,7 @@ class MCTS:
             mask  : (4,) bool — legal moves
         """
  
-        state = board_to_tensor(game.board).to(self.device)
+        state = self.net.board_to_tensor(game.board).to(self.device)
         mask  = action_mask(game).to(self.device)
  
         with torch.no_grad():
@@ -244,7 +244,7 @@ class MCTS:
             # Take action in cloned game, record shaped reward for this step
             move = Move(action)
             moved, merge_reward = game.step(move)
-            reward = compute_reward(moved, merge_reward, game)
+            reward = sqrt_reward(moved, merge_reward, game)
             path.append((key, action, reward))
 
             if not moved:
@@ -319,7 +319,7 @@ class MCTS:
         """
         if game.n_empty > self.empty_threshold:
             # Greedy: one forward pass, no tree search
-            state = board_to_tensor(game.board).to(self.device)
+            state = self.net.board_to_tensor(game.board).to(self.device)
             mask  = action_mask(game).to(self.device)
             with torch.no_grad():
                 policy, _ = self.net(state, mask)
@@ -576,7 +576,7 @@ def evaluate(checkpoint_path: str = "mcts_checkpoint.pt", type: str = "greedy", 
             game = Game2048(seed=i)
             mcts.reset_tree()
             while not game.is_over:
-                state  = board_to_tensor(game.board).to(DEVICE)
+                state  = net.board_to_tensor(game.board).to(DEVICE)
                 mask   = action_mask(game).to(DEVICE)
                 policy, _ = net(state, mask)
                 if type == "greedy":
@@ -688,8 +688,6 @@ def _print_results(label: str, n_games: int, scores: list, max_tiles: list, dura
 
 def main():
     p = argparse.ArgumentParser(description="A2C / MCTS trainer for 2048")
-    p.add_argument("--mode",          type=str,   default="mcts",
-                   help="training mode: 'a2c' or 'mcts' (default: mcts)")
     p.add_argument("--episodes",      type=int,   default=2000)
     p.add_argument("--gamma",         type=float, default=0.99)
     p.add_argument("--lr",            type=float, default=5e-5)
@@ -719,7 +717,7 @@ def main():
         evaluate(args.checkpoint, args.type.lower(), args.eval)
     elif args.display != -1:
         display_agent(args.checkpoint, speed=args.display, type=args.type)
-    elif args.mode.lower() == "mcts":
+    else:
         train_mcts(
             n_episodes        = args.episodes,
             gamma             = args.gamma,
@@ -733,16 +731,6 @@ def main():
             save_dir          = args.dir,
             log_every         = args.log_every,
             checkpoint_path   = args.checkpoint,
-        )
-    else:
-        train(
-            n_episodes      = args.episodes,
-            gamma           = args.gamma,
-            lr              = args.lr,
-            entropy_coef    = args.entropy_coef,
-            value_coef      = args.value_coef,
-            log_every       = args.log_every,
-            checkpoint_path = args.checkpoint,
         )
 
 
