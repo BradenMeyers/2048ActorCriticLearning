@@ -41,7 +41,7 @@ import torch.nn.functional as F
 
 from game import Game2048, Move
 import time
-from utils import STATE_DIM, compute_returns, circ_reward, sqrt_reward, log_reward, action_mask, N_ACTIONS
+from utils import STATE_DIM, compute_returns, circ_reward, sqrt_reward, log_reward, action_mask, N_ACTIONS, ACTION_NAMES, RunningNormalizer
 from networks import LinearActorCritic as ActorCritic
 
 # ===== constants
@@ -346,6 +346,7 @@ def train_mcts(
     checkpoint_path:  str   = "mcts_checkpoint.pt",
     log_path:         str   = "mcts_log.csv",
     log_every:        int   = 50,
+    debug_every:      int   = 0,   # print MCTS search stats every N moves (0 = off)
 ):
     """
     AlphaZero-style training loop with replay buffer and a frozen behavior network.
@@ -377,8 +378,9 @@ def train_mcts(
     print(f"collect_every={collect_every}  n_grad_steps={n_grad_steps}  minibatch={minibatch_size}")
     print(f"checkpoint -> {checkpoint_path}\n")
 
-    net       = ActorCritic().to(DEVICE)
-    optimizer = optim.Adam(net.parameters(), lr=lr)
+    net        = ActorCritic().to(DEVICE)
+    optimizer  = optim.Adam(net.parameters(), lr=lr)
+    ret_normalizer = RunningNormalizer(momentum=0.99)
 
     start_episode = 1
     if os.path.exists(checkpoint_path):
@@ -394,7 +396,7 @@ def train_mcts(
     # Only synced from net at the end of each round.
     target_net = copy.deepcopy(net)
     target_net.eval()
-    mcts = MCTS(net=target_net, device=DEVICE, c=25.0, n_simulations=n_simulations,
+    mcts = MCTS(net=target_net, device=DEVICE, c=45.0, n_simulations=n_simulations,
                 gamma=gamma, terminal_penalty=terminal_penalty)
 
     recent_scores    = deque(maxlen=100)
@@ -415,6 +417,7 @@ def train_mcts(
             mcts.reset_tree()  # fresh tree per episode; reused across moves within it
             episode_data = []  # (state_tensor, mask_tensor, pi_target, reward)
 
+            move_count = 0
             for _ in range(max_steps):
                 if game.is_over:
                     break
@@ -423,10 +426,12 @@ def train_mcts(
                 mask_tensor  = action_mask(game).to(DEVICE)
 
                 # MCTS on the frozen target_net — no gradient tracking needed
-                pi     = mcts.get_policy(game, eta=1.0, add_noise=True)
+                should_debug = debug_every > 0 and move_count % debug_every == 0
+                pi     = mcts.get_policy(game, eta=1.0, add_noise=True, debug=should_debug)
                 target = torch.tensor(pi, dtype=torch.float32)  # keep on CPU until batched
 
                 action = int(torch.multinomial(target, 1).item())
+                move_count += 1
                 moved, merge_reward = game.step(Move(action))
                 reward = sqrt_reward(moved, merge_reward, game)
                 
@@ -482,10 +487,8 @@ def train_mcts(
             actor_loss  = -(pis_t * log_pi).sum(dim=-1).mean()
             # Normalize returns for critic training only
             # Keep raw returns for MCTS backprop
-            ret_mean = returns_t.mean().detach()
-            ret_std  = returns_t.std().detach() + 1e-8
-            critic_loss = F.mse_loss(value_out.squeeze(-1), (returns_t - ret_mean) / ret_std)
-            # critic_loss = F.mse_loss(value_out.squeeze(-1), returns_t)
+            ret_normalizer.update(returns_t)
+            critic_loss = F.mse_loss(value_out.squeeze(-1), ret_normalizer.normalize(returns_t))
 
             loss = actor_loss + value_coef * critic_loss
 
@@ -621,7 +624,7 @@ def display_agent(checkpoint_path: str = "mcts_checkpoint.pt",
         64: (246,94,59),  128: (237,207,114), 256: (237,204,97),
         512: (237,200,80), 1024: (237,197,63), 2048: (237,194,46),
     }
-    mcts = MCTS(net=net, device=DEVICE, c=25.0, n_simulations=2000, empty_threshold=3)
+    mcts = MCTS(net=net, device=DEVICE, c=25.0, n_simulations=200, empty_threshold=3)
 
     for game_i in range(n_games):
         game = Game2048()
@@ -702,6 +705,8 @@ def main():
     p.add_argument("--minibatch",     type=int,   default=512,
                    help="steps sampled per gradient update (default: 512)")
     p.add_argument("--log-every",     type=int,   default=50)
+    p.add_argument("--debug-every",   type=int,   default=0,
+                   help="print MCTS search stats every N moves during collection (0 = off)")
     p.add_argument("--dir",           type=str,   default="",
                    help="directory to save checkpoint and log into (created if needed)")
     p.add_argument("--terminal-penalty", type=float, default=-25.0,
@@ -730,6 +735,7 @@ def main():
             terminal_penalty  = args.terminal_penalty,
             save_dir          = args.dir,
             log_every         = args.log_every,
+            debug_every       = args.debug_every,
             checkpoint_path   = args.checkpoint,
         )
 

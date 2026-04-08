@@ -11,6 +11,7 @@ import torch.nn as nn
 # Do we need a negative reward for losing?
 
 N_ACTIONS = 4   # UP DOWN LEFT RIGHT
+ACTION_NAMES = ["UP", "DN ", "LT ", "RT "]
 N_TILE_LEVELS = 16          # levels 0..15
 STATE_DIM     = 4 * 4 * N_TILE_LEVELS   # 256
 # ================================================================= reward
@@ -93,6 +94,47 @@ def compute_returns(rewards: list, last_value: float, gamma: float) -> list:
     return returns
 
 # Other Utils
+
+class RunningNormalizer:
+    """
+    Maintains an exponential moving average of return mean and variance,
+    then normalizes returns by those running stats.
+
+    Why not per-batch normalization?
+        Per-batch stats shift every update, so the critic's output scale
+        changes every gradient step. When MCTS queries the critic for a leaf
+        value, it gets a number whose meaning depends on the last batch seen —
+        not the absolute quality of the board state.
+
+    Why not raw returns?
+        Returns from sqrt_reward accumulate to ~100-500 over a full game.
+        MSE on raw values that large causes exploding gradients early in training.
+
+    This gives you the best of both: stable scale, consistent meaning.
+    """
+    def __init__(self, momentum: float = 0.99):
+        self.mean = 0.0
+        self.var  = 1.0
+        self.momentum = momentum
+        self._initialized = False
+
+    def update(self, x: torch.Tensor):
+        """Update running stats with a new batch of returns."""
+        batch_mean = x.mean().item()
+        batch_var  = x.var().item() if x.numel() > 1 else 1.0
+        if not self._initialized:
+            self.mean = batch_mean
+            self.var  = max(batch_var, 1e-4)
+            self._initialized = True
+        else:
+            m = self.momentum
+            self.mean = m * self.mean + (1 - m) * batch_mean
+            self.var  = m * self.var  + (1 - m) * max(batch_var, 1e-4)
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize using running stats (not the current batch)."""
+        return (x - self.mean) / (self.var ** 0.5 + 1e-8)
+
 
 def action_mask(game: Game2048) -> torch.Tensor:
     """
