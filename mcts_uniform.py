@@ -124,11 +124,11 @@ class UniformMCTS:
 
     def __init__(
         self,
-        c:               float = 1.5,
+        c:               float = 160,
         n_simulations:   int   = 200,
         gamma:           float = 0.99,
         rollout_depth:   int   = 50,
-        terminal_penalty: float = 0.0,
+        terminal_penalty: float = -10.0,
     ):
         self.c                = c
         self.n_simulations    = n_simulations
@@ -229,7 +229,7 @@ def play_games(
     n_games:        int   = 20,
     n_simulations:  int   = 200,
     rollout_depth:  int   = 50,
-    c:              float = 1.5,
+    c:              float = 160,
     gamma:          float = 0.99,
     reuse_tree:     bool  = False,
     seed:           int   = 0,
@@ -314,10 +314,13 @@ def display(
     speed:         int   = 4,
     n_simulations: int   = 200,
     rollout_depth: int   = 50,
+    c:             float = 160,
+    reuse_tree:    bool  = True,
+    gamma:         float = 0.99,
 ):
     import pygame
 
-    mcts = UniformMCTS(n_simulations=n_simulations, rollout_depth=rollout_depth)
+    mcts = UniformMCTS(n_simulations=n_simulations, rollout_depth=rollout_depth, c=c, gamma=gamma)
 
     pygame.init()
     screen = pygame.display.set_mode((400, 450))
@@ -344,6 +347,8 @@ def display(
                     return
 
             action = mcts.best_action(game)
+            if not reuse_tree:
+                mcts.reset_tree()
             game.step(Move(action))
 
             screen.fill((187, 173, 160))
@@ -385,7 +390,15 @@ def main():
     args = p.parse_args()
 
     if args.display != -1:
-        display(n_simulations=args.sims, rollout_depth=args.rollout, speed=args.display)
+        display(
+            n_games=args.games,
+            n_simulations=args.sims,
+            rollout_depth=args.rollout,
+            c=args.c,
+            speed=args.display,
+            reuse_tree=args.reuse,
+            gamma=args.gamma,
+            )
         return
 
     if args.sims == 0:
