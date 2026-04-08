@@ -37,241 +37,14 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from game import Game2048, Move
-
+from utils import circ_reward, sqrt_reward, log_reward, compute_returns, action_mask
+from networks import CNNActorCritic as ActorCritic
 
 # ===== constants
 
 DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-N_ACTIONS = 4   # UP DOWN LEFT RIGHT
-
-
-# = state encoder
-
-def board_to_tensor(board: np.ndarray) -> torch.Tensor:
-    """
-    Convert 4x4 numpy board to a (1, 4, 4) float tensor using log2 encoding.
-
-    Each cell → log2(value) / 15.0, normalised to [0, 1].
-    Empty cells → 0.0.
-
-    Why log2 instead of one-hot?
-        One-hot treats each tile level as an independent category — the network
-        has no idea 256 and 512 are related. Log2 encoding gives tiles ordinal
-        meaning: equal adjacent cells are always exactly 1/15 apart in value,
-        so the CNN can learn the merge condition (two equal neighbours) as a
-        single consistent filter regardless of which tile level it is.
-
-    Shape: (1, 4, 4) = (channels, H, W).
-        forward() adds the batch dim → (1, 1, 4, 4) before Conv2d.
-    """
-    state = np.zeros((1, 4, 4), dtype=np.float32)
-    for r in range(4):
-        for c in range(4):
-            val = board[r, c]
-            state[0, r, c] = math.log2(val) / 15.0 if val > 0 else 0.0
-    return torch.tensor(state, dtype=torch.float32)
-
-
-def action_mask(game: Game2048) -> torch.Tensor:
-    """
-    Returns a (4,) boolean tensor — True for legal moves.
-    Used to zero out illegal action logits before softmax.
-
-    Due to problems with making moves that dont change the board
-    """
-    mask = torch.zeros(N_ACTIONS, dtype=torch.bool)
-    for m in game.available_moves():
-        mask[int(m)] = True
-    return mask
-
-
-# = network
-class ActorCritic(nn.Module):
-    """
-    CNN shared-trunk actor-critic.
-
-    Why CNN?
-        The merge condition — two equal adjacent tiles — is a 2x1 spatial
-        pattern. A Conv2d filter can represent this directly. A flat linear
-        network has to learn the same pattern implicitly across all 256 inputs,
-        which takes much longer and has to relearn it for every tile level.
-
-    Architecture:
-        Input (1, 4, 4)
-          → Conv2d(1→64,   kernel=2) → ReLU   # local 2x2 patterns
-          → Conv2d(64→128, kernel=2) → ReLU   # higher-level structure
-          → Flatten → Linear(512→256) → ReLU
-               ↓
-        ┌──────┴──────┐
-        ↓             ↓
-     Actor head   Critic head
-     Linear(4)    Linear(1)
-     softmax      raw scalar
-     → π(a|s)     → V(s)
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        self.trunk = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=2),    # (1,4,4) → (64,3,3)
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=2),  # (64,3,3) → (128,2,2)
-            nn.ReLU(),
-            nn.Flatten(),                        # → (512,)
-            nn.Linear(128 * 2 * 2, 256),
-            nn.ReLU(),
-        )
-
-        self.actor_head  = nn.Linear(256, N_ACTIONS)
-        self.critic_head = nn.Linear(256, 1)
-
-
-# class ActorCritic(nn.Module):
-#     """
-#     Shared-trunk network with two heads:
-#         - Actor head  → policy π(a|s), probability over 4 moves
-#         - Critic head → value V(s), expected future return
-
-#     Architecture:
-#         Input (256) → Linear(512) → ReLU → Linear(512) → ReLU
-#                                                 ↓
-#                               ┌─────────────────┤
-#                               ↓                 ↓
-#                          Actor head        Critic head
-#                          Linear(4)         Linear(1)
-#                          (logits)          (scalar)
-#     """
-
-#     def __init__(self, state_dim: int = STATE_DIM, hidden: int = 512):
-#         super().__init__()
-
-#         # Shared trunk — learns board representations useful to both heads
-#         self.trunk = nn.Sequential(
-#             nn.Linear(state_dim, hidden),
-#             nn.ReLU(),
-#             nn.Linear(hidden, hidden),
-#             nn.ReLU(),
-#         )
-
-#         # Actor head — outputs raw logits (NOT probabilities yet)
-#         self.actor_head = nn.Linear(hidden, N_ACTIONS)
-
-#         # Critic head — outputs a single scalar value estimate
-#         self.critic_head = nn.Linear(hidden, 1)
-
-    def forward(self, state: torch.Tensor, mask: torch.Tensor = None):
-        """
-        Parameters
-        ----------
-        state : (1, 4, 4) from board_to_tensor — (channels, H, W)
-                Conv2d needs (batch, C, H, W) = (1, 1, 4, 4), added here.
-        mask  : (4,) bool — True = legal move
-
-        Returns
-        -------
-        policy : (4,)  probability over actions  (batch dim squeezed)
-        value  : (1,)  scalar state value        (batch dim squeezed)
-        """
-        # (1, 4, 4) → (1, 1, 4, 4): add batch dimension for Conv2d
-        if state.dim() == 3:
-            state = state.unsqueeze(0)
-
-        features = self.trunk(state)          # → (1, 256)
-        logits   = self.actor_head(features)  # → (1, 4)
-
-        # Mask illegal moves — unsqueeze mask to broadcast over batch dim
-        if mask is not None:
-            logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
-
-        policy = F.softmax(logits, dim=-1).squeeze(0)  # → (4,)
-        value  = self.critic_head(features).squeeze(0) # → (1,)
-
-        return policy, value
-
-
-# ================================================================= reward
-
-# def compute_reward(moved: bool, merge_reward: int, game: Game2048,
-#                    episode: int = 1, total_episodes: int = 1) -> float:
-#     """
-#     Curriculum reward — shifts from survival-focused to score-focused over time.
-
-#     Early training:  empty_coef=0.8, merge_coef=0.3  → learn to keep board open
-#     Late training:   empty_coef=0.1, merge_coef=1.0  → learn to build big tiles
-
-#     Why curriculum?
-#         Board management (not losing) and tile building (scoring big) are
-#         somewhat separate skills. Learning survival first gives the agent the
-#         foundation to then exploit open space for large merges.
-
-#     Why not just empty cells?
-#         Merging reduces tile count → fewer empty cells → negative reward.
-#         The agent would learn to avoid merging. Empty cell bonus only works
-#         correctly as a secondary signal on top of a merge reward.
-#     """
-#     if not moved:
-#         return -1.0
-
-#     progress   = episode / max(total_episodes, 1)
-#     merge_coef = 0.3 * (1 - progress) + 1.0 * progress   # 0.3 → 1.0
-#     empty_coef = 0.8 * (1 - progress) + 0.1 * progress   # 0.8 → 0.1
-
-#     log_merge      = math.log2(merge_reward + 1)
-#     empty_bonus    = empty_coef * game.n_empty
-#     max_tile_bonus = 0.1 * math.log2(game.max_tile + 1)  # reward maintaining high tiles
-
-#     return merge_coef * log_merge + empty_bonus + max_tile_bonus
-
-
-def compute_reward(moved: bool, merge_reward: int, game: Game2048) -> float:
-    """
-    # TODO could look at reward shaping for improving the credit assignment. 
-    Shaped reward function.
-
-    Components:
-        1. log2(merge_value + 1)  — credit for merges, log-scaled
-        2. 0.1 * n_empty          — small bonus for keeping board open
-
-    Why log scaling?
-        Raw merge values (8, 16, 512, 2048, ...) span 3 orders of magnitude.
-        Without scaling the network chases big merges early and ignores board
-        structure. Log scale compresses this so all merges matter roughly equally.
-
-    Why empty cell bonus?
-        Most steps have merge_reward=0 (no merge happened).  Without a per-step
-        signal the agent gets almost no feedback and learning is very slow.
-        Rewarding open board space gives a gradient every single step.
-    """
-    if not moved:
-        return -1.0     # small penalty for illegal move (shouldn't happen with masking)
-
-    log_merge = math.log2(merge_reward + 1)
-    empty_bonus = 0.6 * game.n_empty # Should i reward this more? 
-    # TODO could add reward here for max tile
-    return (log_merge + empty_bonus) * 0.1 # scale down to keep rewards in a reasonable range
-
 
 # = training loop
-
-def compute_returns(rewards: list, last_value: float, gamma: float) -> list:
-    """
-    Reward-to-go: G_t = r_t + y*r_{t+1} + γ²*r_{t+2} + ...
-
-    Built backwards from episode end. last_value bootstraps from the critic
-    if the episode hit max_steps (otherwise 0.0 — game ended naturally).
-
-    This is what the critic is trained to predict.
-    TODO: upgrade to GAE (Generalized Advantage Estimation) for lower variance.
-    """
-    returns = []
-    G = last_value
-    for r in reversed(rewards):
-        G = r + gamma * G
-        returns.append(G)
-    returns.reverse()
-    return returns
-
 
 def train(
     n_episodes:      int   = 2000,
@@ -317,7 +90,7 @@ def train(
             if game.is_over:
                 break
 
-            state_tensor = board_to_tensor(game.board).to(DEVICE)
+            state_tensor = net.board_to_tensor(game.board).to(DEVICE)
             mask_tensor  = action_mask(game).to(DEVICE)
 
             policy, value = net(state_tensor, mask_tensor)
@@ -329,8 +102,7 @@ def train(
             # Take the action in the game
             move           = Move(action.item())
             moved, raw_rew = game.step(move)        # Move and get score delta (merge reward)
-            reward         = compute_reward(moved, raw_rew, game) # Reward for this transition. 
-            # reward         = compute_reward(moved, raw_rew, game, episode, total_episodes) # Reward for this transition. 
+            reward         = log_reward(moved, raw_rew, game, empty_bonus=0.2) * 0.1 # Reward for this transition. 
 
             states.append(state_tensor)
             actions.append(action)
@@ -345,7 +117,7 @@ def train(
             print("Episode hit max steps without ending. Bootstrapping last value from critic.")
             print("Warning this will cause issues in the training because we wont be learning how to play with higher tiles.")
             with torch.no_grad():
-                last_state = board_to_tensor(game.board).to(DEVICE)
+                last_state = net.board_to_tensor(game.board).to(DEVICE)
                 last_mask  = action_mask(game).to(DEVICE)
                 _, last_v  = net(last_state, last_mask)
                 last_value = last_v.item()
@@ -375,8 +147,9 @@ def train(
 
         # Entropy: -E[log π(a)] from sampled log_probs
         # Prevents policy collapsing to always picking one move
-        # entropy = -log_probs_t.mean() # TODO check this
-        entropy = dist.entropy().mean()  # exact H(π) = -Σ π(a) log π(a)
+        entropy = -log_probs_t.mean() # TODO check this
+        # TODO HERE
+        # entropy = dist.entropy().mean()  # exact H(π) = -Σ π(a) log π(a)
 
         # Combined loss
         loss = actor_loss + value_coef * critic_loss - entropy_coef * entropy
@@ -457,7 +230,7 @@ def evaluate(checkpoint_path: str = "a2c_checkpoint.pt", n_games: int = 100):
         for i in range(n_games):
             game = Game2048(seed=i)
             while not game.is_over:
-                state  = board_to_tensor(game.board).to(DEVICE)
+                state  = net.board_to_tensor(game.board).to(DEVICE)
                 mask   = action_mask(game).to(DEVICE)
                 policy, _ = net(state, mask)
                 # At eval time: pick the highest-probability legal move (greedy)
@@ -546,7 +319,7 @@ def display_agent(checkpoint_path: str = "a2c_checkpoint.pt",
                     return
 
             with torch.no_grad():
-                state  = board_to_tensor(game.board).to(DEVICE)
+                state  = net.board_to_tensor(game.board).to(DEVICE)
                 mask   = action_mask(game).to(DEVICE)
                 policy, _ = net(state, mask)
                 action = policy.argmax().item() # Greedy action

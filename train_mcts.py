@@ -41,14 +41,12 @@ import torch.nn.functional as F
 
 from game import Game2048, Move
 import time
-
+from utils import STATE_DIM, compute_returns, circ_reward, sqrt_reward, log_reward, action_mask
+from networks import LinearActorCritic as ActorCritic
 
 # ===== constants
 
 DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-N_ACTIONS = 4   # UP DOWN LEFT RIGHT
-N_TILE_LEVELS = 16          # levels 0..15
-STATE_DIM     = 4 * 4 * N_TILE_LEVELS   # 256
 
 class MCTSNode:
     # Represents a node in the MCTS tree.
@@ -110,7 +108,10 @@ class MCTSNode:
 
         puct = np.where(self.mask, self.Q + exploration, -np.inf)  # Mask illegal moves with -inf
 
-        return int(np.argmax(puct))  # Return the action index with highest PUCT score
+        # Break ties randomly to avoid always picking the first index
+        max_val = np.max(puct)
+        candidates = np.where(puct == max_val)[0]
+        return int(np.random.choice(candidates))
     
     def get_policy(self, eta: float) -> np.ndarray:
         """
@@ -135,7 +136,6 @@ class MCTSNode:
         return counts / total_counts  # Normalize to get probabilities
     
 
-
 class MCTS:
     """
     Monte Carlo Tree Search guided by a trained ActorCritic network.
@@ -154,7 +154,7 @@ class MCTS:
         self,
         net,                          # trained ActorCritic
         device,                       # torch device
-        c:              float = 1.5,  # exploration constant in PUCT
+        c:              float = 25.0, # exploration constant in PUCT
         n_simulations:  int   = 100,  # simulations per move
         gamma:          float = 0.99, # discount factor for backprop returns
         empty_threshold: int  = 6,    # use greedy above this many empty cells
@@ -328,438 +328,8 @@ class MCTS:
         policy = self.get_policy(game, eta=float("inf"))
         return int(np.argmax(policy))
 
-# = state encoder
-
-def board_to_tensor(board: np.ndarray) -> torch.Tensor:
-    """
-    Convert a 4x4 numpy board to a (256,) one-hot float tensor.
-
-    Each cell becomes a one-hot vector of length 16:
-        empty  → index 0
-        tile 2 → index 1
-        tile 4 → index 2
-        ...
-        tile 2^15 → index 15
-    """
-    indices = np.where(board > 0, np.log2(board.clip(1)).astype(np.int32), 0).clip(0, N_TILE_LEVELS - 1)
-    state = np.zeros((16, N_TILE_LEVELS), dtype=np.float32)
-    state[np.arange(16), indices.flatten()] = 1.0
-    return torch.from_numpy(state.flatten())
-
-# def board_to_tensor(board: np.ndarray) -> torch.Tensor:
-#     """
-#     Convert 4x4 numpy board to a (1, 4, 4) float tensor using log2 encoding.
-
-#     Each cell → log2(value) / 15.0, normalised to [0, 1].
-#     Empty cells → 0.0.
-
-#     Why log2 instead of one-hot?
-#         One-hot treats each tile level as an independent category — the network
-#         has no idea 256 and 512 are related. Log2 encoding gives tiles ordinal
-#         meaning: equal adjacent cells are always exactly 1/15 apart in value,
-#         so the CNN can learn the merge condition (two equal neighbours) as a
-#         single consistent filter regardless of which tile level it is.
-
-#     Shape: (1, 4, 4) = (channels, H, W).
-#         forward() adds the batch dim → (1, 1, 4, 4) before Conv2d.
-#     """
-#     state = np.zeros((1, 4, 4), dtype=np.float32)
-#     for r in range(4):
-#         for c in range(4):
-#             val = board[r, c]
-#             state[0, r, c] = math.log2(val) / 15.0 if val > 0 else 0.0
-#     return torch.tensor(state, dtype=torch.float32)
-
-
-def action_mask(game: Game2048) -> torch.Tensor:
-    """
-    Returns a (4,) boolean tensor — True for legal moves.
-    Used to zero out illegal action logits before softmax.
-
-    Due to problems with making moves that dont change the board
-    """
-    mask = torch.zeros(N_ACTIONS, dtype=torch.bool)
-    for m in game.available_moves():
-        mask[int(m)] = True
-    return mask
-
-
-# # = network
-# class ActorCritic(nn.Module):
-#     """
-#     CNN shared-trunk actor-critic.
-
-#     Why CNN?
-#         The merge condition — two equal adjacent tiles — is a 2x1 spatial
-#         pattern. A Conv2d filter can represent this directly. A flat linear
-#         network has to learn the same pattern implicitly across all 256 inputs,
-#         which takes much longer and has to relearn it for every tile level.
-
-#     Architecture:
-#         Input (1, 4, 4)
-#           → Conv2d(1→64,   kernel=2) → ReLU   # local 2x2 patterns
-#           → Conv2d(64→128, kernel=2) → ReLU   # higher-level structure
-#           → Flatten → Linear(512→256) → ReLU
-#                ↓
-#         ┌──────┴──────┐
-#         ↓             ↓
-#      Actor head   Critic head
-#      Linear(4)    Linear(1)
-#      softmax      raw scalar
-#      → π(a|s)     → V(s)
-#     """
-
-#     def __init__(self):
-#         super().__init__()
-
-#         self.trunk = nn.Sequential(
-#             nn.Conv2d(1, 64, kernel_size=2),    # (1,4,4) → (64,3,3)
-#             nn.ReLU(),
-#             nn.Conv2d(64, 128, kernel_size=2),  # (64,3,3) → (128,2,2)
-#             nn.ReLU(),
-#             nn.Flatten(),                        # → (512,)
-#             nn.Linear(128 * 2 * 2, 256),
-#             nn.ReLU(),
-#         )
-
-#         self.actor_head  = nn.Linear(256, N_ACTIONS)
-#         self.critic_head = nn.Linear(256, 1)
-
-#     def forward(self, state: torch.Tensor, mask: torch.Tensor = None):
-#         """
-#         Parameters
-#         ----------
-#         state : (1, 4, 4) from board_to_tensor — (channels, H, W)
-#                 Conv2d needs (batch, C, H, W) = (1, 1, 4, 4), added here.
-#         mask  : (4,) bool — True = legal move
-
-#         Returns
-#         -------
-#         policy : (4,)  probability over actions  (batch dim squeezed)
-#         value  : (1,)  scalar state value        (batch dim squeezed)
-#         """
-#         # (1, 4, 4) → (1, 1, 4, 4): add batch dimension for Conv2d
-#         if state.dim() == 3:
-#             state = state.unsqueeze(0)
-
-#         features = self.trunk(state)          # → (1, 256)
-#         logits   = self.actor_head(features)  # → (1, 4)
-
-#         # Mask illegal moves — unsqueeze mask to broadcast over batch dim
-#         if mask is not None:
-#             logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
-
-#         policy = F.softmax(logits, dim=-1).squeeze(0)  # → (4,)
-#         value  = self.critic_head(features).squeeze(0) # → (1,)
-
-#         return policy, value
-
-class ActorCritic(nn.Module):
-    """
-    Shared-trunk network with two heads:
-        - Actor head  → policy π(a|s), probability over 4 moves
-        - Critic head → value V(s), expected future return
-
-    Architecture:
-        Input (256) → Linear(512) → ReLU → Linear(512) → ReLU
-                                                ↓
-                              ┌─────────────────┤
-                              ↓                 ↓
-                         Actor head        Critic head
-                         Linear(4)         Linear(1)
-                         (logits)          (scalar)
-    """
-
-    def __init__(self, state_dim: int = STATE_DIM, hidden: int = 512):
-        super().__init__()
-
-        # Shared trunk — learns board representations useful to both heads
-        self.trunk = nn.Sequential(
-            nn.Linear(state_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-        )
-
-        # Actor head — outputs raw logits (NOT probabilities yet)
-        self.actor_head = nn.Linear(hidden, N_ACTIONS)
-
-        # Critic head — outputs a single scalar value estimate
-        self.critic_head = nn.Linear(hidden, 1)
-
-    def forward(self, state: torch.Tensor, mask: torch.Tensor = None):
-        """
-        Parameters
-        ----------
-        state : (batch, 256) or (256,) float tensor
-        mask  : (batch, 4) or (4,) bool tensor — True = legal move
-                If provided, illegal moves get -inf logits before softmax.
-
-        Returns
-        -------
-        policy : (batch, 4) action probability distribution
-        value  : (batch, 1) state value estimate
-        """
-        features = self.trunk(state)
-
-        logits = self.actor_head(features)
-
-        # Mask illegal moves — set their logits to -inf so softmax → 0
-        if mask is not None:
-            logits = logits.masked_fill(~mask, float("-inf"))
-
-        policy = F.softmax(logits, dim=-1)
-        value  = self.critic_head(features)
-
-        return policy, value
-
-
-# ================================================================= reward
-
-# def compute_reward(moved: bool, merge_reward: int, game: Game2048,
-#                    episode: int = 1, total_episodes: int = 1) -> float:
-#     """
-#     Curriculum reward — shifts from survival-focused to score-focused over time.
-
-#     Early training:  empty_coef=0.8, merge_coef=0.3  → learn to keep board open
-#     Late training:   empty_coef=0.1, merge_coef=1.0  → learn to build big tiles
-
-#     Why curriculum?
-#         Board management (not losing) and tile building (scoring big) are
-#         somewhat separate skills. Learning survival first gives the agent the
-#         foundation to then exploit open space for large merges.
-
-#     Why not just empty cells?
-#         Merging reduces tile count → fewer empty cells → negative reward.
-#         The agent would learn to avoid merging. Empty cell bonus only works
-#         correctly as a secondary signal on top of a merge reward.
-#     """
-#     if not moved:
-#         return -1.0
-
-#     progress   = episode / max(total_episodes, 1)
-#     merge_coef = 0.3 * (1 - progress) + 1.0 * progress   # 0.3 → 1.0
-#     empty_coef = 0.8 * (1 - progress) + 0.1 * progress   # 0.8 → 0.1
-
-#     log_merge      = math.log2(merge_reward + 1)
-#     empty_bonus    = empty_coef * game.n_empty
-#     max_tile_bonus = 0.1 * math.log2(game.max_tile + 1)  # reward maintaining high tiles
-
-#     return merge_coef * log_merge + empty_bonus + max_tile_bonus
-
-
-def compute_reward(moved: bool, merge_reward: int, game: Game2048) -> float:
-    """
-    # TODO could look at reward shaping for improving the credit assignment. 
-    Shaped reward function.
-
-    Components:
-        1. log2(merge_value + 1)  — credit for merges, log-scaled
-        2. 0.1 * n_empty          — small bonus for keeping board open
-
-    Why log scaling?
-        Raw merge values (8, 16, 512, 2048, ...) span 3 orders of magnitude.
-        Without scaling the network chases big merges early and ignores board
-        structure. Log scale compresses this so all merges matter roughly equally.
-
-    Why empty cell bonus?
-        Most steps have merge_reward=0 (no merge happened).  Without a per-step
-        signal the agent gets almost no feedback and learning is very slow.
-        Rewarding open board space gives a gradient every single step.
-    """
-    if not moved:
-        return -1.0     # small penalty for illegal move (shouldn't happen with masking)
-
-    log_merge = math.log2(merge_reward + 1)
-    empty_bonus = 0.6 * game.n_empty # Should i reward this more? 
-    # TODO could add reward here for max tile
-    return (log_merge + empty_bonus) * 0.1 # scale down to keep rewards in a reasonable range
-
 
 # = training loop
-
-def compute_returns(rewards: list, last_value: float, gamma: float) -> list:
-    """
-    Reward-to-go: G_t = r_t + y*r_{t+1} + γ²*r_{t+2} + ...
-
-    Built backwards from episode end. last_value bootstraps from the critic
-    if the episode hit max_steps (otherwise 0.0 — game ended naturally).
-
-    This is what the critic is trained to predict.
-    TODO: upgrade to GAE (Generalized Advantage Estimation) for lower variance.
-    """
-    returns = []
-    G = last_value
-    for r in reversed(rewards):
-        G = r + gamma * G
-        returns.append(G)
-    returns.reverse()
-    return returns
-
-
-def train(
-    n_episodes:      int   = 2000,
-    gamma:           float = 0.99,
-    lr:              float = 3e-4,
-    entropy_coef:    float = 0.01,
-    value_coef:      float = 0.5,
-    max_steps:       int   = 5000,
-    checkpoint_path: str   = "mcts_checkpoint.pt",
-    log_path:        str   = "mcts_log.csv",
-    log_every:       int   = 50,
-):
-    print(f"Training on: {DEVICE}")
-    print(f"Episodes: {n_episodes}  γ={gamma}  lr={lr}  entropy_coef={entropy_coef}\n")
-
-    net       = ActorCritic().to(DEVICE)
-    optimizer = optim.Adam(net.parameters(), lr=lr)
-
-    # Resume from checkpoint if one exists
-    start_episode = 1
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-        net.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_episode = checkpoint["episode"] + 1
-        print(f"Resumed from checkpoint — continuing from episode {start_episode}\n")
-    else:
-        print("No checkpoint found — starting fresh\n")
-
-    total_episodes = start_episode + n_episodes  # for curriculum progress
-
-    recent_scores    = deque(maxlen=100)
-    recent_max_tiles = deque(maxlen=100)
-    log_rows         = []
-    t_start          = time.time()
-
-    for episode in range(start_episode, start_episode + n_episodes):
-
-        game = Game2048()
-        states, actions, rewards, values, log_probs, masks = [], [], [], [], [], []
-
-        for _ in range(max_steps):
-            if game.is_over:
-                break
-
-            state_tensor = board_to_tensor(game.board).to(DEVICE)
-            mask_tensor  = action_mask(game).to(DEVICE)
-
-            policy, value = net(state_tensor, mask_tensor)
-
-            # Sample action from policy distribution
-            dist   = torch.distributions.Categorical(policy)
-            action = dist.sample()
-
-            # Take the action in the game
-            move           = Move(action.item())
-            moved, raw_rew = game.step(move)        # Move and get score delta (merge reward)
-            reward         = compute_reward(moved, raw_rew, game) # Reward for this transition. 
-            # reward         = compute_reward(moved, raw_rew, game, episode, total_episodes) # Reward with ciriculum learing
-
-            states.append(state_tensor)
-            actions.append(action)
-            rewards.append(reward)
-            values.append(value.squeeze()) # why do we have to squeeze here?
-            log_probs.append(dist.log_prob(action))
-            masks.append(mask_tensor)
-
-        # Bootstrap if episode hit max_steps without finishing
-        last_value = 0.0
-        if not game.is_over and len(states) > 0:
-            print("Episode hit max steps without ending. Bootstrapping last value from critic.")
-            print("Warning this will cause issues in the training because we wont be learning how to play with higher tiles.")
-            with torch.no_grad():
-                last_state = board_to_tensor(game.board).to(DEVICE)
-                last_mask  = action_mask(game).to(DEVICE)
-                _, last_v  = net(last_state, last_mask)
-                last_value = last_v.item()
-
-        returns   = compute_returns(rewards, last_value, gamma) # Reward credit assignment to previous states
-        returns_t = torch.tensor(returns, dtype=torch.float32).to(DEVICE)
-        values_t  = torch.stack(values)
-        log_probs_t = torch.stack(log_probs)
-
-        # Advantage = how much better was this outcome vs what the critic expected?
-        # TODO what does detach mean?
-        # Detach values so critic gradient doesn't flow through the advantage
-        advantages = returns_t - values_t.detach()
-
-        # Normalize advantages ONLY — not returns.
-        # Normalizing returns destroys the scale the critic needs to learn V(s).
-        # Normalizing advantages just stabilizes the actor gradient.
-        if len(advantages) > 1:
-            # returns_t   = (returns_t   - returns_t.mean())   / (returns_t.std()   + 1e-8)
-            advantages  = (advantages  - advantages.mean())  / (advantages.std()  + 1e-8)
-
-        # Actor loss: push up probability of actions with positive advantage
-        actor_loss = -(log_probs_t * advantages).mean()
-
-        # Critic loss: make value predictions track actual returns
-        critic_loss = F.mse_loss(values_t, returns_t)
-
-        # Entropy: -E[log π(a)] from sampled log_probs
-        # Prevents policy collapsing to always picking one move
-        entropy = -log_probs_t.mean()
-
-        # Combined loss
-        loss = actor_loss + value_coef * critic_loss - entropy_coef * entropy
-
-        # ---- update network ----
-        optimizer.zero_grad()
-        loss.backward()
-        # Gradient clipping — prevents exploding gradients
-        nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
-        optimizer.step()
-
-        recent_scores.append(game.score)
-        recent_max_tiles.append(game.max_tile)
-
-        if episode % log_every == 0:
-            avg_score    = np.mean(recent_scores)
-            avg_max_tile = np.mean(recent_max_tiles)
-            elapsed      = time.time() - t_start
-            print(
-                f"Ep {episode:>5} | "
-                f"AvgScore {avg_score:>8.0f} | "
-                f"AvgMaxTile {avg_max_tile:>6.0f} | "
-                f"Loss {loss.item():>7.4f} | "
-                f"Entropy {entropy.item():>5.3f} | "
-                f"Time {elapsed:>6.0f}s"
-            )
-            log_rows.append({
-                "episode":      episode,
-                "avg_score":    round(avg_score, 1),
-                "avg_max_tile": round(avg_max_tile, 1),
-                "loss":         round(loss.item(), 5),
-                "actor_loss":   round(actor_loss.item(), 5),
-                "critic_loss":  round(critic_loss.item(), 5),
-                "entropy":      round(entropy.item(), 5),
-                "elapsed_s":    round(elapsed, 1),
-            })
-
-    # save checkpoint
-    torch.save({
-        "model_state_dict":     net.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "episode":              start_episode + n_episodes - 1,
-        "config": {
-            "gamma":        gamma,
-            "lr":           lr,
-            "entropy_coef": entropy_coef,
-            "value_coef":   value_coef,
-        }
-    }, checkpoint_path)
-    print(f"\nModel saved → {checkpoint_path}")
-
-    if log_rows:
-        with open(log_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=log_rows[0].keys())
-            writer.writeheader()
-            writer.writerows(log_rows)
-        print(f"Log saved   → {log_path}")
-
-    return net
-
 
 def train_mcts(
     n_episodes:       int   = 2000,
@@ -824,7 +394,7 @@ def train_mcts(
     # Only synced from net at the end of each round.
     target_net = copy.deepcopy(net)
     target_net.eval()
-    mcts = MCTS(net=target_net, device=DEVICE, c=1.5, n_simulations=n_simulations,
+    mcts = MCTS(net=target_net, device=DEVICE, c=25.0, n_simulations=n_simulations,
                 gamma=gamma, terminal_penalty=terminal_penalty)
 
     recent_scores    = deque(maxlen=100)
@@ -849,7 +419,7 @@ def train_mcts(
                 if game.is_over:
                     break
 
-                state_tensor = board_to_tensor(game.board).to(DEVICE)
+                state_tensor = net.board_to_tensor(game.board).to(DEVICE)
                 mask_tensor  = action_mask(game).to(DEVICE)
 
                 # MCTS on the frozen target_net — no gradient tracking needed
@@ -858,8 +428,8 @@ def train_mcts(
 
                 action = int(torch.multinomial(target, 1).item())
                 moved, merge_reward = game.step(Move(action))
-                reward = (math.log2(merge_reward+1) if merge_reward > 0 else 0.0) \
-                       + 0.1 * game.n_empty
+                reward = sqrt_reward(moved, merge_reward, game)
+                
 
                 episode_data.append((state_tensor.cpu(), mask_tensor.cpu(), target, reward))
 
@@ -875,7 +445,7 @@ def train_mcts(
             last_value = 0.0
             if not game.is_over:
                 with torch.no_grad():
-                    last_state = board_to_tensor(game.board).to(DEVICE)
+                    last_state = net.board_to_tensor(game.board).to(DEVICE)
                     last_mask  = action_mask(game).to(DEVICE)
                     _, last_v  = net(last_state, last_mask)
                     last_value = last_v.item()
@@ -910,7 +480,12 @@ def train_mcts(
 
             log_pi      = torch.log(policy_out + 1e-8)        # (B, 4)
             actor_loss  = -(pis_t * log_pi).sum(dim=-1).mean()
-            critic_loss = F.mse_loss(value_out.squeeze(-1), returns_t)
+            # Normalize returns for critic training only
+            # Keep raw returns for MCTS backprop
+            ret_mean = returns_t.mean().detach()
+            ret_std  = returns_t.std().detach() + 1e-8
+            critic_loss = F.mse_loss(value_out.squeeze(-1), (returns_t - ret_mean) / ret_std)
+            # critic_loss = F.mse_loss(value_out.squeeze(-1), returns_t)
 
             loss = actor_loss + value_coef * critic_loss
 
@@ -979,7 +554,7 @@ def train_mcts(
 
 
 # = evaluation
-def evaluate(checkpoint_path: str = "mcts_checkpoint.pt", type: str = "greedy", n_games: int = 100, n_simulations: int = 100, c: float = 1.5):
+def evaluate(checkpoint_path: str = "mcts_checkpoint.pt", type: str = "greedy", n_games: int = 100, n_simulations: int = 100, c: float = 25.0):
     start_time = time.time()
     if not os.path.exists(checkpoint_path):
         print(f"No checkpoint found at {checkpoint_path}. Train first.")
@@ -1009,7 +584,7 @@ def evaluate(checkpoint_path: str = "mcts_checkpoint.pt", type: str = "greedy", 
                 elif type == "mcts":
                     # This still uses the greedy 
                     action = mcts.search(game)
-                elif type == "uniform":
+                else:
                     action = game.step(random.choice(game.available_moves()))
                 
                 game.step(Move(action))
@@ -1046,7 +621,7 @@ def display_agent(checkpoint_path: str = "mcts_checkpoint.pt",
         64: (246,94,59),  128: (237,207,114), 256: (237,204,97),
         512: (237,200,80), 1024: (237,197,63), 2048: (237,194,46),
     }
-    mcts = MCTS(net=net, device=DEVICE, c=1.5, n_simulations=2000, empty_threshold=3)
+    mcts = MCTS(net=net, device=DEVICE, c=25.0, n_simulations=2000, empty_threshold=3)
 
     for game_i in range(n_games):
         game = Game2048()
@@ -1058,13 +633,15 @@ def display_agent(checkpoint_path: str = "mcts_checkpoint.pt",
                     return
 
             with torch.no_grad():
-                state  = board_to_tensor(game.board).to(DEVICE)
+                state  = net.board_to_tensor(game.board).to(DEVICE)
                 mask   = action_mask(game).to(DEVICE)
                 policy, _ = net(state, mask)
                 if type == "greedy":
                     action = policy.argmax().item() # Greedy action
                 elif type == "mcts":
                     action = mcts.search(game)
+                else:
+                    action = random.choice(game.available_moves())
             game.step(Move(action))
 
             screen.fill((187, 173, 160))
@@ -1108,10 +685,6 @@ def _print_results(label: str, n_games: int, scores: list, max_tiles: list, dura
         print(f"    {tile:>5}: {bar:<40} {pct:.1f}%")
 
 # ===== CLI
-
-# TODO: Should look at gamma because we care about future rewards a lot
-# but we need it to make it so we don't lose the game. 
-# Do we need a negative reward for losing?
 
 def main():
     p = argparse.ArgumentParser(description="A2C / MCTS trainer for 2048")
