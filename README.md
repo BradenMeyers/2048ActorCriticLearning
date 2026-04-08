@@ -1,6 +1,8 @@
 # 2048ActorCriticLearning
 Actor Critic Policy learning for 2048 game
 
+MAX SCORE SEEN:
+score=31840  max_tile=2048
 
 TODO:
 - Go back to training with CNN?
