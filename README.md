@@ -7,6 +7,43 @@ Teaching an agent to play 2048 using reinforcement learning. Two training algori
 
 A pure-MCTS diagnostic agent (**UniformMCTS**) is also included, which uses no neural network and serves as a strong search-only baseline.
 
+---
+
+## Key Findings
+
+### 1. Pure MCTS is already a strong baseline — but it's slow
+
+Without any neural network, UniformMCTS with random rollouts can play well given enough simulations and rollout depth. The search alone develops reasonable game strategy by exploring future states. The catch: every move requires hundreds of tree simulations, making play slow.
+
+### 2. A2C learns a fast greedy policy, but training is long
+
+A2C distills game strategy into a CNN. Once trained, inference is a single forward pass — essentially instant. Training takes tens of thousands of episodes to converge, but the result is an agent that plays in real time.
+
+![A2C Training Curve](pretrained/a2c/a2c_training.png)
+
+### 3. MCTS-AC trains even slower, but learns a better policy
+
+MCTS-AC trains a network to imitate MCTS search output rather than raw game rewards. Each episode runs full MCTS to generate move targets, so data collection is slow. But the learned policy is higher quality because it is trained on search-quality decisions.
+
+![MCTS-AC Training Curve](pretrained/mcts/a2c_training.png)
+
+The chart below shows both agents over training time — MCTS-AC achieves higher scores with far fewer episodes, but each episode takes much longer because MCTS runs on every move during training.
+
+![Training Efficiency](results/findings/training_efficiency.png)
+
+### 4. MCTS + trained policy gives the best results
+
+The strongest configuration is running MCTS at evaluation time using the trained MCTS-AC network as the policy and value prior. The network guides the tree toward promising moves, and the search evaluates the next several steps before committing.
+
+![Performance Comparison](results/findings/performance_comparison.png)
+
+> The MCTS-AC greedy score being lower than A2C's is expected — the MCTS-AC network was trained to output search-quality distributions, not greedy-optimal ones. It shines when paired with live MCTS search.
+
+### 5. Sims vs. speed is the core tradeoff
+
+More MCTS simulations per move → better play, but proportionally slower. At 200 sims a game takes minutes; the greedy policy runs in real time. Choosing how many sims to run is the main lever for tuning the quality/speed balance.
+
+
 
 ---
 
@@ -198,7 +235,6 @@ Produces: `a2c_checkpoint.pt`, `a2c_log.csv`
 python main.py --mode train_a2c --episodes 110000 --lr 3e-4 --entropy-coef 0.01
 ```
 
-![A2C Training Curve](pretrained/a2c/a2c_training.png)
 
 ---
 
