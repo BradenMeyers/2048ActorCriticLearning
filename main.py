@@ -21,7 +21,6 @@ Examples
     python main.py --mode evaluate --agent mcts --eval-type mcts --eval-sims 200
     python main.py --mode display --agent mcts --checkpoint mcts_checkpoint.pt --speed 4
     python main.py --mode uniform_mcts --sims 200 --games 20 --baseline
-    python main.py --mode simulate --sim-agent expectimax --depth 3 --n 500
     python main.py --mode gui
     python main.py --mode terminal
 """
@@ -41,7 +40,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--mode", required=True,
         choices=["train_a2c", "train_mcts", "uniform_mcts",
-                 "evaluate", "display", "simulate", "gui", "terminal"],
+                 "evaluate", "display", "gui", "terminal"],
     )
 
     # ── shared ────────────────────────────────────────────────────────────────
@@ -87,14 +86,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--c",        type=float, default=160.0)
     p.add_argument("--reuse",    action="store_true", help="reuse tree between moves")
     p.add_argument("--baseline", action="store_true", help="also run random baseline")
-
-    # ── simulate ──────────────────────────────────────────────────────────────
-    p.add_argument("--sim-agent", default="random",
-                   choices=["random", "greedy", "expectimax"])
-    p.add_argument("--n",      type=int,  default=100)
-    p.add_argument("--depth",  type=int,  default=3)
-    p.add_argument("--csv",    type=str,  default=None)
-    p.add_argument("--verbose",action="store_true")
 
     return p
 
@@ -272,21 +263,6 @@ def main():
             if args.baseline:
                 print("\nRunning random baseline for comparison...")
                 play_random(n_games=args.games, seed=args.seed or 42)
-
-    # ── simulate ──────────────────────────────────────────────────────────────
-    elif args.mode == "simulate":
-        from simulate import run_simulation, save_csv
-        print(f"Running {args.n} games with agent='{args.sim_agent}' ...")
-        stats = run_simulation(
-            n_games    = args.n,
-            agent_name = args.sim_agent,
-            depth      = args.depth,
-            seed       = args.seed,
-            verbose    = args.verbose,
-        )
-        stats.print_summary()
-        if args.csv:
-            save_csv(stats, args.csv)
 
     # ── gui ───────────────────────────────────────────────────────────────────
     elif args.mode == "gui":

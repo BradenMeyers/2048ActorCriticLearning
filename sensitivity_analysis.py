@@ -35,6 +35,8 @@ def run_config(
     gamma:            float,
     terminal_penalty: float,
     reuse_tree:       bool,
+    dir_alpha:        float,
+    dir_epsilon:      float,
 ) -> dict:
     """Run n_games with the given config. Returns a result dict."""
     random.seed(seed)
@@ -46,6 +48,8 @@ def run_config(
         gamma=gamma,
         rollout_depth=rollout_depth,
         terminal_penalty=terminal_penalty,
+        dir_alpha=dir_alpha,
+        dir_epsilon= dir_epsilon,
     )
 
     scores, max_tiles = [], []
@@ -82,6 +86,8 @@ def run_config(
         "gamma":           gamma,
         "terminal_penalty": terminal_penalty,
         "reuse_tree":      reuse_tree,
+        "dir_alpha":       dir_alpha,
+        "dir_epsilon":     dir_epsilon,
     }
 
 
@@ -101,6 +107,8 @@ def build_configs(n_games: int, n_simulations: int, seed: int) -> list[dict]:
         gamma=0.99,
         terminal_penalty=-10.0,
         reuse_tree=False,
+        dir_alpha=0.1,
+        dir_epsilon=0.1,
     )
 
     configs = []
@@ -116,23 +124,37 @@ def build_configs(n_games: int, n_simulations: int, seed: int) -> list[dict]:
     add("BASE *")
 
     # ── c: exploration constant ───────────────────────────────────────────────
-    for c in [5, 20, 40, 80, 320, 640, 1280]:
+    cs = [5, 20, 40, 80, 320, 640, 1280]
+    cs = [100]
+    for c in cs:
         add(f"c={c}", c=c)
 
     # ── rollout_depth: leaf evaluation depth ──────────────────────────────────
-    for d in [1, 3, 5, 20, 50, 100]:
+    ds = [1, 3, 5, 20, 50, 100]
+    ds = [10]
+    for d in ds:
         add(f"rollout={d}", rollout_depth=d)
 
     # ── gamma: discount factor ────────────────────────────────────────────────
-    for g in [0.5, 0.8, 0.9, 0.95, 1.0]:
+    gs = [0.5, 0.8, 0.9, 0.95, 1.0]
+    for g in gs:
         add(f"gamma={g}", gamma=g)
 
     # ── terminal_penalty: reward at game-over ─────────────────────────────────
-    for tp in [-100, -50, -20, -5, -1, 0]:
+    tp_values = [-100, -50, -20, -5, -1, 0]
+    for tp in tp_values:
         add(f"penalty={tp}", terminal_penalty=tp)
 
     # ── reuse_tree ────────────────────────────────────────────────────────────
     add("reuse_tree=True",  reuse_tree=True)
+
+    # ── dir_alpha ─────────────────────────────────────────────────────────────
+    for alpha in [0.1, 0.3, 0.5, 0.7, 0.9]:
+        add(f"dir_alpha={alpha}", dir_alpha=alpha)
+
+    # ── dir_epsilon ────────────────────────────────────────────────────────────
+    for epsilon in [0.1, 0.3, 0.5, 0.7, 0.9]:
+        add(f"dir_epsilon={epsilon}", dir_epsilon=epsilon)
 
     return configs
 
@@ -160,6 +182,7 @@ def run_random_baseline(n_games: int, seed: int) -> dict:
         "elapsed":          time.time() - t0,
         "c": "-", "rollout_depth": "-", "gamma": "-",
         "terminal_penalty": "-", "reuse_tree": "-",
+        "dir_alpha": "-", "dir_epsilon": "-",
     }
 
 
@@ -221,6 +244,8 @@ def print_sensitivity_summary(results: list[dict]) -> None:
         "gamma":           [r for r in results if r["label"].startswith("gamma=")],
         "terminal_penalty":[r for r in results if r["label"].startswith("penalty=")],
         "reuse_tree":      [r for r in results if r["label"].startswith("reuse_tree=")],
+        "dir_alpha":       [r for r in results if r["label"].startswith("dir_alpha=")],
+        "dir_epsilon":     [r for r in results if r["label"].startswith("dir_epsilon=")],
     }
 
     print("\nSensitivity summary (delta mean score vs BASE):")
