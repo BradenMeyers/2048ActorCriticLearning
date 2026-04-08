@@ -1,5 +1,5 @@
 """
-Plot training metrics from an A2C log CSV.
+Plot training metrics from an log CSV.
 
 Usage:
     python plot_log.py                          # plots a2c_log.csv
@@ -21,7 +21,7 @@ for path in LOG_FILES:
     dfs.append(df)
 
 fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-fig.suptitle("A2C Training Metrics", fontsize=14)
+fig.suptitle("Training Metrics", fontsize=14)
 
 METRICS = [
     ("avg_score",    "Avg Score",       axes[0, 0]),
@@ -44,6 +44,6 @@ for col, title, ax in METRICS:
     ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig("a2c_training.png", dpi=150)
-print("Saved a2c_training.png")
+plt.savefig("training.png", dpi=150)
+print("Saved training.png")
 plt.show()

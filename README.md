@@ -44,6 +44,31 @@ Because training takes so long, pretrained `a2c_checkpoint.pt` and `mcts_checkpo
 
 ## Evaluation
 
+### Random Policy
+```bash
+# Random baseline
+python main.py --mode evaluate --agent baseline --games 100
+```
+
+```
+  Random baseline — 100 games
+==================================================
+  Mean score      :     1052.9
+  Median score    :     1016.0
+  Max score       :       3044
+  Win rate (≥2048):     0.0%
+  Duration        : 1.47s
+
+  Max tile distribution:
+       16:                                          1.0%
+       32: █                                        2.0%
+       64: ██████████████████████                   44.0%
+      128: ███████████████████████                  47.0%
+      256: ███                                      6.0%
+
+```
+
+
 ### Greedy evaluation (fast)
 
 ```bash
@@ -52,18 +77,19 @@ python main.py --mode evaluate --agent a2c --games 100
 ```
 
 ```
-A2C (greedy) — 100 games
-Mean score      :     6950.4
-Median score    :     6466.0
-Max score       :    17128.0
-Win rate (≥2048):      0.0%
-Duration        :    24.91s
+  A2C (greedy) — 100 games
+==================================================
+  Mean score      :     6950.4
+  Median score    :     6466.0
+  Max score       :      17128
+  Win rate (≥2048):     0.0%
+  Duration        : 28.07s
 
-Max tile distribution:
-    128:  5.0%
-    256: 25.0%
-    512: 57.0%
-   1024: 13.0%
+  Max tile distribution:
+      128: ██                                       5.0%
+      256: ████████████                             25.0%
+      512: ████████████████████████████             57.0%
+     1024: ██████                                   13.0%
 ```
 
 ```bash
@@ -72,18 +98,19 @@ python main.py --mode evaluate --agent mcts --eval-type greedy --games 100
 ```
 
 ```
-MCTS-AC (greedy) — 100 games
-Mean score      :     2413.3
-Median score    :     2294.0
-Max score       :     5092.0
-Win rate (≥2048):      0.0%
-Duration        :    11.03s
+  MCTS-AC (greedy) — 100 games
+==================================================
+  Mean score      :     2413.3
+  Median score    :     2294.0
+  Max score       :       5092
+  Win rate (≥2048):     0.0%
+  Duration        : 11.11s
 
-Max tile distribution:
-     64:  8.0%
-    128: 45.0%
-    256: 45.0%
-    512:  2.0%
+  Max tile distribution:
+       64: ████                                     8.0%
+      128: ██████████████████████                   45.0%
+      256: ██████████████████████                   45.0%
+      512: █                                        2.0%
 ```
 
 ### MCTS with and without policy (slow)
@@ -112,10 +139,8 @@ Max tile distribution:
 ```bash
 # Uniform MCTS (no network)
 python main.py --mode evaluate --agent uniform --sims 200 --games 100 --rollout 10
-
-# Random baseline
-python main.py --mode evaluate --agent baseline --games 100
 ```
+
 
 ---
 
@@ -207,7 +232,7 @@ python main.py --mode train_mcts --episodes 5000 --n-simulations 100 \
 
 Training resumes automatically from a checkpoint if one exists in `--dir`.
 
-![MCTS-AC Training Curve](pretrained/mcts/a2c_training.png)
+![MCTS-AC Training Curve](pretrained/mcts/mcts_training.png)
 
 ---
 
