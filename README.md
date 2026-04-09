@@ -25,17 +25,17 @@ A2C distills game strategy into a CNN. Once trained, inference is a single forwa
 
 MCTS-AC trains a network to imitate MCTS search output rather than raw game rewards. Each episode runs full MCTS to generate move targets, so data collection is slow. But the learned policy is higher quality because it is trained on search-quality decisions.
 
-![MCTS-AC Training Curve](pretrained/mcts/a2c_training.png)
+![MCTS-AC Training Curve](pretrained/mcts/mcts_training.png)
 
 The chart below shows both agents over training time — MCTS-AC achieves higher scores with far fewer episodes, but each episode takes much longer because MCTS runs on every move during training.
 
-![Training Efficiency](results/findings/training_efficiency.png)
+![Training Efficiency](results/training_efficiency.png)
 
 ### 4. MCTS + trained policy gives the best results
 
 The strongest configuration is running MCTS at evaluation time using the trained MCTS-AC network as the policy and value prior. The network guides the tree toward promising moves, and the search evaluates the next several steps before committing.
 
-![Performance Comparison](results/findings/performance_comparison.png)
+![Performance Comparison](results/performance_comparison.png)
 
 > The MCTS-AC greedy score being lower than A2C's is expected — the MCTS-AC network was trained to output search-quality distributions, not greedy-optimal ones. It shines when paired with live MCTS search.
 
